@@ -4,6 +4,9 @@
 #include <cstring>
 #include <string>
 #include <vector>
+#include "StarRocks_Transaction.h"
+#include <mutex>
+#include <unordered_map>
 using json = nlohmann::json;
 #define PROXYJSON
 
@@ -86,56 +89,35 @@ using json = nlohmann::json;
 using std::function;
 using std::vector;
 
-// Returns the first words of a statement in upper case, skipping whitespace and comments.
-static std::vector<std::string> starrocks_leading_words(const char* sql, size_t length, size_t limit) {
-	std::vector<std::string> words;
-	for (size_t pos = 0; pos < length && words.size() < limit;) {
-		if (isspace(static_cast<unsigned char>(sql[pos]))) { ++pos; continue; }
-		if (pos + 1 < length && sql[pos] == '/' && sql[pos+1] == '*') {
-			pos += 2;
-			while (pos + 1 < length && !(sql[pos] == '*' && sql[pos+1] == '/')) ++pos;
-			pos += 2; continue;
-		}
-		if (sql[pos] == '#' || (pos + 1 < length && sql[pos] == '-' && sql[pos+1] == '-')) {
-			while (pos < length && sql[pos] != '\n') ++pos;
-			continue;
-		}
-		if (!isalpha(static_cast<unsigned char>(sql[pos]))) break;
-		std::string word;
-		while (pos < length && (isalnum(static_cast<unsigned char>(sql[pos])) || sql[pos] == '_'))
-			word += static_cast<char>(toupper(static_cast<unsigned char>(sql[pos++])));
-		words.push_back(std::move(word));
-	}
-	return words;
+// The table of the sessions whose FE connection can be the target of a KILL. A client knows the id that
+// ProxySQL gave it in the greeting, and the FE knows its own id of the connection.
+namespace {
+struct StarRocksKillTarget {
+	unsigned long fe_connection_id;
+	std::string fe_address;
+};
+std::mutex starrocks_kill_mutex;
+std::unordered_map<uint32_t, StarRocksKillTarget> starrocks_kill_targets;
 }
 
-// StarRocks keeps an explicit transaction in the FE connection but does not
-// report it in the OK packet status flags, so we follow the statements ourselves.
-// Returns 1 if the text begins a transaction, -1 if it ends one and 0 otherwise.
-// We fear that a COMMIT hidden in a literal of a multi-statement text would make
-// us treat a transaction as finished while it is open, so a multi-statement
-// text can only begin a transaction, never end one.
-static int starrocks_transaction_command(const char* sql, size_t length) {
-	const auto classify = [](const char* text, size_t size) {
-		const std::vector<std::string> words = starrocks_leading_words(text, size, 2);
-		if (words.empty()) return 0;
-		if (words[0] == "BEGIN" || (words[0] == "START" && words.size() == 2 && words[1] == "TRANSACTION")) return 1;
-		if (words[0] == "COMMIT" || words[0] == "ROLLBACK") return -1;
-		return 0;
-	};
-	const char* first_end = static_cast<const char*>(memchr(sql, ';', length));
-	if (!first_end) return classify(sql, length);
-	size_t rest = static_cast<size_t>(first_end - sql) + 1;
-	while (rest < length && isspace(static_cast<unsigned char>(sql[rest]))) ++rest;
-	if (rest == length) return classify(sql, static_cast<size_t>(first_end - sql));
-	for (size_t pos = 0; pos < length;) {
-		if (classify(sql + pos, length - pos) == 1) return 1;
-		const char* separator = static_cast<const char*>(memchr(sql + pos, ';', length - pos));
-		if (!separator) break;
-		pos = static_cast<size_t>(separator - sql) + 1;
-	}
-	return 0;
+static void starrocks_kill_register(uint32_t id, unsigned long fe_connection_id, const std::string& fe_address) {
+	std::lock_guard<std::mutex> lock(starrocks_kill_mutex);
+	starrocks_kill_targets[id] = StarRocksKillTarget { fe_connection_id, fe_address };
 }
+
+static void starrocks_kill_unregister(uint32_t id) {
+	std::lock_guard<std::mutex> lock(starrocks_kill_mutex);
+	starrocks_kill_targets.erase(id);
+}
+
+static bool starrocks_kill_lookup(uint32_t id, StarRocksKillTarget& target) {
+	std::lock_guard<std::mutex> lock(starrocks_kill_mutex);
+	const auto found = starrocks_kill_targets.find(id);
+	if (found == starrocks_kill_targets.end()) return false;
+	target = found->second;
+	return true;
+}
+
 
 static inline char is_digit(char c) {
 	if(c >= '0' && c <= '9')
@@ -771,6 +753,17 @@ MySQL_Session::MySQL_Session() {
 	passthrough_connect_in_flight = false;
 	passthrough_connect_failed = false;
 	passthrough_connect_fail_reason = NULL;
+	starrocks_auth_session = false;
+	starrocks_login_phase = STARROCKS_LOGIN_NONE;
+	starrocks_login_retries = 0;
+	starrocks_login_has_db = false;
+	memset(starrocks_login_response, 0, sizeof(starrocks_login_response));
+	starrocks_login_response_len = 0;
+	starrocks_login_response_ready = false;
+	starrocks_login_rejected = false;
+	starrocks_login_errno = 0;
+	starrocks_close_after_output = false;
+	starrocks_kill_registered = false;
 	this->wait_timeout = mysql_thread___wait_timeout;
 	backend_closed_in_fast_forward = false;
 	fast_forward_grace_start_time = 0;
@@ -867,6 +860,9 @@ void MySQL_Session::reset() {
  * @brief Destructor for the MySQL session.
  */
 MySQL_Session::~MySQL_Session() {
+	if (starrocks_kill_registered) {
+		starrocks_kill_unregister(thread_session_id);
+	}
 	reset();
  // we moved this out to allow CHANGE_USER
 
@@ -883,6 +879,11 @@ MySQL_Session::~MySQL_Session() {
 					break;
 #endif /* PROXYSQLCLICKHOUSE */
 				default:
+					// We never counted the user of a StarRocks FE authenticated session against a
+					// mysql_users row, so there is nothing to give back.
+					if (starrocks_auth_session) {
+						break;
+					}
 					if (use_ldap_auth == false) {
 						GloMyAuth->decrease_frontend_user_connections(
 							client_myds->myconn->userinfo->username,
@@ -2769,6 +2770,12 @@ bool MySQL_Session::handler_again___verify_ldap_user_variable() {
 }
 
 bool MySQL_Session::handler_again___verify_backend_autocommit() {
+	// We want to send SET autocommit only when we can check that it took effect. StarRocks never sets
+	// SERVER_STATUS_AUTOCOMMIT in its OK packets, so IsAutoCommit() cannot match what we set: we would
+	// send SET autocommit again and again and never run the query of the client.
+	if (starrocks_auth_session || mybe->server_myds->myconn->parent->myhgc->attributes.starrocks_backend) {
+		return false;
+	}
 	if (sending_set_autocommit) {
 		// if sending_set_autocommit==true, the next query proxysql is going
 		// to run defines autocommit, for example:
@@ -2846,6 +2853,15 @@ bool MySQL_Session::handler_again___verify_backend_autocommit() {
 
 bool MySQL_Session::handler_again___verify_backend_user_schema() {
 	MySQL_Data_Stream *myds=mybe->server_myds;
+	if (starrocks_auth_session) {
+		// We have no password to log in again, so the connection keeps the user that the FE authenticated.
+		// Only the database can change.
+		if (strcmp(client_myds->myconn->userinfo->schemaname, myds->myconn->userinfo->schemaname)) {
+			set_previous_status_mode3();
+			NEXT_IMMEDIATE_NEW(CHANGING_SCHEMA);
+		}
+		return false;
+	}
 	proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Session %p , client: %s , backend: %s\n", this, client_myds->myconn->userinfo->username, mybe->server_myds->myconn->userinfo->username);
 	proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Session %p , client: %s , backend: %s\n", this, client_myds->myconn->userinfo->schemaname, mybe->server_myds->myconn->userinfo->schemaname);
 	if (client_myds->myconn->userinfo->hash!=mybe->server_myds->myconn->userinfo->hash) {
@@ -3609,6 +3625,22 @@ bool MySQL_Session::handler_again___status_CONNECTING_SERVER(int *_rc) {
 			mybe->server_myds->max_connect_time=0;
 			NEXT_IMMEDIATE_NEW(WAITING_CLIENT_DATA);
 		}
+	}
+	if (starrocks_auth_session && mybe->server_myds->myconn==NULL) {
+		// We have no password for a new FE connection: the FE authenticated the client on the connection that
+		// is gone. The client has to connect again, so we answer this request with an error and end the session.
+		string errmsg {};
+		string_format(
+			"ProxySQL: the session has no StarRocks FE connection for hostgroup %d. Connect again",
+			errmsg, current_hostgroup
+		);
+		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1927,(char *)"70100", errmsg.c_str(), true);
+		RequestEnd(mybe->server_myds, 1927, errmsg.c_str());
+		while (previous_status.size()) {
+			previous_status.pop();
+		}
+		starrocks_close_after_output = true;
+		NEXT_IMMEDIATE_NEW(WAITING_CLIENT_DATA);
 	}
 	if (mybe->server_myds->myconn==NULL) {
 		handler___client_DSS_QUERY_SENT___server_DSS_NOT_INITIALIZED__get_connection();
@@ -5091,6 +5123,13 @@ __get_pkts_from_client:
 	//     process mirror only status==WAITING_CLIENT_DATA
 	for (unsigned int j=0; j< ( client_myds->PSarrayIN ? client_myds->PSarrayIN->len : 0)  || (mirror==true && status==WAITING_CLIENT_DATA) ;) {
 		if (mirror==false) {
+			if (starrocks_auth_session && status == WAITING_CLIENT_DATA && starrocks_login_phase == STARROCKS_LOGIN_NONE &&
+			    client_authenticated && starrocks_fe_left()) {
+				// We want a request that arrives after the FE left to not run, because the session
+				// cannot move to another FE. The session ends when the client has read its last response.
+				starrocks_close_after_output = true;
+				break;
+			}
 			if (session_type == PROXYSQL_SESSION_MYSQL && !session_fast_forward &&
 			    (mysql_thread___resultset_spill_enabled || client_myds->spill_serialize_commands)) {
 				client_myds->spill_serialize_commands = true;
@@ -6169,7 +6208,15 @@ handler_again:
 			break;
 		case CONNECTING_CLIENT:
 			//fprintf(stderr,"CONNECTING_CLIENT\n");
-			// FIXME: to implement
+			if (starrocks_auth_session && starrocks_login_phase != STARROCKS_LOGIN_NONE) {
+				if (handler_starrocks_login(wrong_pass) == -1) {
+					handler_ret = -1;
+					return handler_ret;
+				}
+				if (status != CONNECTING_CLIENT) {
+					goto handler_again;
+				}
+			}
 			break;
 		case AUTHENTICATING_BACKEND_FOR_CLIENT:
 			{
@@ -6635,6 +6682,10 @@ handler_again:
 		handler_ret = -1;
 		return handler_ret;
 	}
+	if (starrocks_session_must_end()) {
+		handler_ret = -1;
+		return handler_ret;
+	}
 	handler_ret = 0;
 	return handler_ret;
 }
@@ -6879,6 +6930,15 @@ void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE_
 }
 
 void MySQL_Session::handler___status_CONNECTING_CLIENT___STATE_SERVER_HANDSHAKE(PtrSize_t *pkt, bool *wrong_pass) {
+	if (starrocks_auth_session && (starrocks_login_phase == STARROCKS_LOGIN_CONNECTING ||
+	    starrocks_login_phase == STARROCKS_LOGIN_RESPONDED || starrocks_login_response_ready)) {
+		// The client has not been greeted, or its response is already on the way to the FE.
+		l_free(pkt->size, pkt->ptr);
+		proxy_error("Unexpected packet from client %s:%d during the StarRocks FE login. Disconnecting it\n",
+			client_myds->addr.addr, client_myds->addr.port);
+		set_unhealthy();
+		return;
+	}
 	bool is_encrypted = client_myds->encrypted;
 	bool handshake_response_return = client_myds->myprot.process_pkt_handshake_response((unsigned char *)pkt->ptr,pkt->size);
 	bool handshake_err = true;
@@ -8776,6 +8836,18 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_CHANGE_USER(PtrSize_t *pkt, bool *wrong_pass) {
 	gtid_hid=-1;
 	proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Got COM_CHANGE_USER packet\n");
+	if (starrocks_auth_session) {
+		// The FE authenticated the client on the connection of the session, and ProxySQL has no password to
+		// authenticate another user there. The session stays as it is.
+		l_free(pkt->size,pkt->ptr);
+		client_myds->setDSS_STATE_QUERY_SENT_NET();
+		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1235,(char *)"42000",
+			(char *)"ProxySQL: COM_CHANGE_USER is not supported when the StarRocks FE authenticates the clients. Connect again as the other user", true);
+		client_myds->DSS=STATE_SLEEP;
+		status=WAITING_CLIENT_DATA;
+		*wrong_pass=false;
+		return;
+	}
 	//if (session_type == PROXYSQL_SESSION_MYSQL) {
 	if (session_type == PROXYSQL_SESSION_MYSQL || session_type == PROXYSQL_SESSION_SQLITE) {
 		reset();
@@ -8863,6 +8935,17 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 
 void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_RESET_CONNECTION(PtrSize_t *pkt) {
 	proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Got MYSQL_COM_RESET_CONNECTION packet\n");
+
+	if (starrocks_auth_session) {
+		// The reset would drop the FE connection that took the login of the client, and ProxySQL cannot log in again.
+		l_free(pkt->size,pkt->ptr);
+		client_myds->setDSS_STATE_QUERY_SENT_NET();
+		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1235,(char *)"42000",
+			(char *)"ProxySQL: COM_RESET_CONNECTION is not supported when the StarRocks FE authenticates the clients. Connect again", true);
+		client_myds->DSS=STATE_SLEEP;
+		status=WAITING_CLIENT_DATA;
+		return;
+	}
 
 	if (session_type == PROXYSQL_SESSION_MYSQL || session_type == PROXYSQL_SESSION_SQLITE) {
 		// Backup the current relevant session values
@@ -9518,6 +9601,11 @@ void MySQL_Session::Memory_Stats() {
 void MySQL_Session::create_new_session_and_reset_connection(MySQL_Data_Stream *_myds) {
 	MySQL_Data_Stream *new_myds = NULL;
 	MySQL_Connection * mc = _myds->myconn;
+	if (mc->starrocks_relay) {
+		// The reset logs in again with a password that we do not have.
+		_myds->destroy_MySQL_Connection_From_Pool(true);
+		return;
+	}
 	// we remove the connection from the original data stream
 	_myds->detach_connection();
 	_myds->unplug_backend();
@@ -9586,6 +9674,10 @@ bool MySQL_Session::handle_command_query_kill(PtrSize_t *pkt) {
 										tki = 1;
 									}
 								}
+							}
+							if (tki >= 0 && starrocks_auth_session) {
+								// ProxySQL cannot log in as the user, so the FE runs the KILL on the connection of this client.
+								return starrocks_rewrite_kill(pkt, tki == 1, static_cast<unsigned int>(id));
 							}
 							if (tki >= 0) {
 								proxy_debug(PROXY_DEBUG_MYSQL_QUERY_PROCESSOR, 2, "Killing %s %d\n", (tki == 0 ? "CONNECTION" : "QUERY") , id);
@@ -10094,6 +10186,9 @@ bool MySQL_Session::starrocks_hostgroup_enabled(int hostgroup) {
 // that are not ONLINE, so the old connection is never reused.
 bool MySQL_Session::starrocks_release_offline_backend(MySQL_Data_Stream *myds) {
 	if (mirror || myds == NULL || myds->myconn == NULL) return false;
+	// A session whose login the FE took cannot move to another FE: it ends instead,
+	// see starrocks_session_must_end().
+	if (starrocks_auth_session) return false;
 	MySQL_Connection *conn = myds->myconn;
 	if (!conn->parent->myhgc->attributes.starrocks_backend) return false;
 	if (conn->parent->get_status() == MYSQL_SERVER_STATUS_ONLINE) return false;
@@ -10111,4 +10206,359 @@ void MySQL_Session::starrocks_release_offline_backends() {
 		MySQL_Backend *backend = (MySQL_Backend *)mybes->index(i);
 		starrocks_release_offline_backend(backend->server_myds);
 	}
+}
+
+// ---------------------------------------------------------------------------
+// StarRocks FE authentication (mysql-starrocks_auth_hostgroup)
+//
+// We want the StarRocks FE to authenticate the clients, so ProxySQL holds no
+// password. A client that connects gets the scramble of a fresh FE connection
+// in its greeting, and its answer goes to that FE connection as the answer of
+// the connection itself. The FE connection then belongs to this client for its
+// whole life. The MariaDB client library suspends the login of the FE
+// connection after it has read the scramble (see PROXYSQL_RELAY in mysql.h)
+// and continues it when we have the answer of the client.
+// ---------------------------------------------------------------------------
+
+MySQL_Connection *MySQL_Session::starrocks_relay_connection() {
+	if (mybes == NULL) return NULL;
+	for (unsigned int i = 0; i < mybes->len; i++) {
+		MySQL_Backend *backend = (MySQL_Backend *)mybes->index(i);
+		if (backend->server_myds && backend->server_myds->myconn && backend->server_myds->myconn->starrocks_relay) {
+			return backend->server_myds->myconn;
+		}
+	}
+	return NULL;
+}
+
+bool MySQL_Session::starrocks_fe_left() {
+	MySQL_Connection *conn = starrocks_relay_connection();
+	if (conn == NULL) return true;
+	return conn->parent->get_status() != MYSQL_SERVER_STATUS_ONLINE;
+}
+
+bool MySQL_Session::starrocks_session_must_end() {
+	if (!starrocks_auth_session || mirror || client_myds == NULL) return false;
+	// A request that runs finishes on its FE first.
+	if (status != WAITING_CLIENT_DATA || starrocks_login_phase != STARROCKS_LOGIN_NONE || !client_authenticated) return false;
+	if (!starrocks_close_after_output && !starrocks_fe_left()) return false;
+	// We want the client to receive the whole response before the connection ends.
+	if (client_myds->available_data_out()) return false;
+	if (client_myds->encrypted && client_myds->ssl && client_myds->wbio_ssl &&
+	    (client_myds->ssl_write_len || BIO_number_written(client_myds->wbio_ssl) > BIO_number_read(client_myds->wbio_ssl))) {
+		return false;
+	}
+	MySQL_Connection *conn = starrocks_relay_connection();
+	if (conn) {
+		proxy_info("Closing client connection %s:%d because its StarRocks FE %s:%d is not ONLINE\n",
+			client_myds->addr.addr, client_myds->addr.port, conn->parent->address, conn->parent->port);
+	} else {
+		proxy_info("Closing client connection %s:%d because its StarRocks FE connection is gone\n",
+			client_myds->addr.addr, client_myds->addr.port);
+	}
+	return true;
+}
+
+void MySQL_Session::starrocks_login_fail(unsigned int err, const char *sqlstate, const char *message, bool& wrong_pass) {
+	const std::string text = message ? message : "";
+	// The client has a greeting from us only after the first phase.
+	const uint8_t pid = (starrocks_login_phase == STARROCKS_LOGIN_CONNECTING) ? 0 : client_myds->pkt_sid + 1;
+	const char *user = client_myds->myconn->userinfo->username;
+	if (err == 1045 || err == 1044 || err == 1049 || err == 1130 || err == 1698) {
+		proxy_info("StarRocks FE login of user '%s' from %s:%d failed: %u, %s\n", user ? user : "",
+			client_myds->addr.addr, client_myds->addr.port, err, text.c_str());
+	} else {
+		proxy_warning("StarRocks FE login of user '%s' from %s:%d failed: %u, %s\n", user ? user : "",
+			client_myds->addr.addr, client_myds->addr.port, err, text.c_str());
+	}
+	if (err == 1045) {
+		__sync_fetch_and_add(&MyHGM->status.access_denied_wrong_password, 1);
+	}
+	client_myds->setDSS_STATE_QUERY_SENT_NET();
+	if (starrocks_login_phase == STARROCKS_LOGIN_CONNECTING) {
+		// The client has no greeting, so it does not know that the protocol has SQL states. Like a server
+		// that refuses the connection, we send the error without one.
+		mysql_hdr header;
+		header.pkt_id = 0;
+		header.pkt_length = 1 + sizeof(uint16_t) + text.size();
+		const unsigned int size = sizeof(mysql_hdr) + header.pkt_length;
+		unsigned char *packet = (unsigned char *)l_alloc(size);
+		memcpy(packet, &header, sizeof(mysql_hdr));
+		packet[sizeof(mysql_hdr)] = 0xff;
+		const uint16_t code = err;
+		memcpy(packet + sizeof(mysql_hdr) + 1, &code, sizeof(code));
+		memcpy(packet + sizeof(mysql_hdr) + 1 + sizeof(code), text.data(), text.size());
+		client_myds->PSarrayOUT->add(packet, size);
+		client_myds->pkt_sid = 0;
+		thread->status_variables.stvar[st_var_generated_pkt_err]++;
+	} else {
+		client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, pid, err, sqlstate, text.c_str(), true);
+	}
+	if (GloMyLogger) {
+		GloMyLogger->log_audit_entry(PROXYSQL_MYSQL_AUTH_ERR, this, NULL, const_cast<char *>(text.c_str()));
+	}
+	__sync_add_and_fetch(&MyHGM->status.client_connections_aborted, 1);
+	// A client that the FE refuses counts for the host cache like any client with wrong credentials.
+	if (mysql_thread___client_host_cache_size && err < 2000) {
+		GloMTH->update_client_host_cache(client_myds->client_addr, true);
+	}
+	client_myds->auth_in_progress = 0;
+	starrocks_login_phase = STARROCKS_LOGIN_NONE;
+	client_myds->DSS = STATE_SLEEP;
+	wrong_pass = true;
+}
+
+bool MySQL_Session::starrocks_login_open(bool& wrong_pass) {
+	const int hostgroup = default_hostgroup;
+	current_hostgroup = hostgroup;
+	mybe = find_or_create_backend(hostgroup);
+	MySQL_Data_Stream *myds = mybe->server_myds;
+	// A fresh connection only: the pool must never hand a connection of another client to this one.
+	MySQL_Connection *mc = MyHGM->get_MyConn_from_pool(hostgroup, this, true, NULL, 0, -1);
+	if (mc == NULL) {
+		std::string errmsg;
+		string_format("ProxySQL: no StarRocks FE is available in hostgroup %d", errmsg, hostgroup);
+		starrocks_login_fail(9001, "HY000", errmsg.c_str(), wrong_pass);
+		return false;
+	}
+	myds->attach_connection(mc);
+	mc->relay_enable();
+	myds->connect_retries_on_failure = 0;
+	myds->max_connect_time = 0;
+	mc->handler(0);
+	myds->fd = mc->fd;
+	myds->DSS = STATE_MARIADB_CONNECTING;
+	return true;
+}
+
+void MySQL_Session::starrocks_login_feed(bool& wrong_pass) {
+	MySQL_Connection *mc = starrocks_relay_connection();
+	starrocks_login_response_ready = false;
+	client_myds->auth_in_progress = 0;
+	if (starrocks_login_rejected) {
+		starrocks_login_fail(1045, "28000", starrocks_login_reject_message.c_str(), wrong_pass);
+		return;
+	}
+	if (mc == NULL || mc->relay.state != PROXYSQL_RELAY_SCRAMBLE_READY) {
+		starrocks_login_fail(2013, "HY000", "ProxySQL: the StarRocks FE connection is not ready for the login", wrong_pass);
+		return;
+	}
+	// A client without a database gets the default schema, like with any other login.
+	const std::string db = (starrocks_login_has_db && !starrocks_login_db.empty())
+		? starrocks_login_db : std::string(mysql_thread___default_schema);
+	MySQL_Connection_userinfo *userinfo = client_myds->myconn->userinfo;
+	userinfo->set(const_cast<char *>(starrocks_login_user.c_str()), const_cast<char *>(""), NULL, NULL);
+	userinfo->set_schemaname(const_cast<char *>(db.c_str()), db.size());
+	mc->userinfo->set(userinfo);
+	mc->relay_set_client(starrocks_login_user.c_str(), db.c_str(), starrocks_login_response, starrocks_login_response_len);
+	mc->myds->wait_until = thread->curtime + (unsigned long long)mysql_thread___connect_timeout_server * 1000;
+	starrocks_login_phase = STARROCKS_LOGIN_RESPONDED;
+}
+
+void MySQL_Session::starrocks_login_complete(bool& wrong_pass) {
+	MySQL_Connection *mc = starrocks_relay_connection();
+	MySQL_Data_Stream *myds = mybe->server_myds;
+	myds->myds_type = MYDS_BACKEND;
+	myds->DSS = STATE_MARIADB_GENERIC;
+	myds->wait_until = 0;
+	myds->max_connect_time = 0;
+	mc->reusable = false;
+	if (handle_session_track_capabilities() == false) {
+		// The connection is closed. The session has no other one and cannot log in again.
+		starrocks_login_fail(9001, "HY000", "ProxySQL: the StarRocks FE lacks the capabilities that ProxySQL needs", wrong_pass);
+		return;
+	}
+	// The user is not in mysql_users, so ProxySQL knows no limits or settings for it.
+	transaction_persistent = true;
+	session_fast_forward = SESSION_FORWARD_TYPE_NONE;
+	schema_locked = false;
+	user_max_connections = 0;
+	if (default_schema) {
+		free(default_schema);
+	}
+	default_schema = strdup(client_myds->myconn->userinfo->schemaname);
+	client_authenticated = true;
+	starrocks_kill_register(thread_session_id, mysql_thread_id(mc->mysql),
+		std::string(mc->parent->address) + ":" + std::to_string(mc->parent->port));
+	starrocks_kill_registered = true;
+	__sync_fetch_and_add(&MyHGM->status.client_connections_prim_pass, 1);
+	if (GloMyLogger) {
+		GloMyLogger->log_audit_entry(PROXYSQL_MYSQL_AUTH_OK, this, NULL);
+	}
+	const uint8_t pid = client_myds->pkt_sid + 1;
+	client_myds->DSS = STATE_CLIENT_HANDSHAKE;
+	client_myds->myprot.generate_pkt_OK(true, NULL, NULL, pid, 0, 0, 2, 0, NULL);
+	client_myds->DSS = STATE_CLIENT_AUTH_OK;
+	client_myds->auth_in_progress = 0;
+	starrocks_login_phase = STARROCKS_LOGIN_NONE;
+	status = WAITING_CLIENT_DATA;
+	if (mysql_thread___client_host_cache_size) {
+		GloMTH->update_client_host_cache(client_myds->client_addr, false);
+	}
+}
+
+int MySQL_Session::handler_starrocks_login(bool& wrong_pass) {
+	if (starrocks_login_phase == STARROCKS_LOGIN_NONE) return 0;
+
+	if (starrocks_login_phase == STARROCKS_LOGIN_FAILED) {
+		// The FE connection failed after the greeting. We answer when the client has sent its response, so the
+		// error has the sequence number that the client expects.
+		if (starrocks_login_response_ready) {
+			starrocks_login_response_ready = false;
+			starrocks_login_fail(starrocks_login_errno, starrocks_login_sqlstate.c_str(), starrocks_login_error.c_str(), wrong_pass);
+		}
+		return 0;
+	}
+
+	if (starrocks_login_phase == STARROCKS_LOGIN_CONNECTING && starrocks_relay_connection() == NULL) {
+		if (max_connections_reached) {
+			starrocks_login_fail(1040, "08004", "Too many connections", wrong_pass);
+			return 0;
+		}
+		if (!starrocks_login_open(wrong_pass)) return 0;
+	}
+
+	MySQL_Connection *mc = starrocks_relay_connection();
+	if (mc == NULL) {
+		starrocks_login_fail(2013, "HY000", "ProxySQL: the StarRocks FE connection is gone", wrong_pass);
+		return 0;
+	}
+	MySQL_Data_Stream *myds = mc->myds;
+
+	short events = 0;
+	switch (starrocks_login_phase) {
+		case STARROCKS_LOGIN_CONNECTING:
+			events = myds->revents;
+			break;
+		case STARROCKS_LOGIN_GREETED:
+			if (starrocks_login_response_ready) {
+				starrocks_login_feed(wrong_pass);
+				if (wrong_pass) return 0;
+				// The library waits for READ events and the response is the reason to continue.
+				events = POLLIN;
+			} else {
+				// The FE sends nothing while it waits for the response. Any event means that it closed the connection.
+				events = myds->revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL);
+				if (events == 0) return 0;
+			}
+			break;
+		case STARROCKS_LOGIN_RESPONDED:
+			events = myds->revents;
+			break;
+		default:
+			return 0;
+	}
+	myds->revents = 0;
+
+	const int rc = mc->async_connect(events);
+	if (myds->mypolls == NULL) {
+		myds->assign_fd_from_mysql_conn();
+		thread->mypolls.add(POLLIN|POLLOUT, myds->fd, myds, thread->curtime);
+	}
+	switch (rc) {
+		case 0:
+			if (starrocks_login_phase == STARROCKS_LOGIN_RESPONDED) {
+				starrocks_login_complete(wrong_pass);
+			} else {
+				starrocks_login_fail(2013, "HY000", "ProxySQL: the StarRocks FE login ended before the client answered", wrong_pass);
+			}
+			return 0;
+		case 1:
+			if (starrocks_login_phase == STARROCKS_LOGIN_CONNECTING && mc->relay.state == PROXYSQL_RELAY_SCRAMBLE_READY) {
+				// We know the scramble of the FE, so the client can get its greeting.
+				memcpy(client_myds->myprot.preset_scramble, mc->relay.scramble, sizeof(client_myds->myprot.preset_scramble));
+				client_myds->myprot.use_preset_scramble = true;
+				const bool greeted = client_myds->myprot.generate_pkt_initial_handshake(true, NULL, NULL, &thread_session_id, true);
+				client_myds->myprot.use_preset_scramble = false;
+				if (!greeted) {
+					starrocks_login_fail(2013, "HY000", "ProxySQL: cannot send the greeting", wrong_pass);
+					return 0;
+				}
+				// The client has mysql-connect_timeout_client to answer, and the thread closes the session when
+				// that time ends. The connection state machine must not report a timeout of its own before.
+				myds->wait_until = thread->curtime + (unsigned long long)mysql_thread___connect_timeout_client * 1000;
+				starrocks_login_phase = STARROCKS_LOGIN_GREETED;
+			}
+			return 0;
+		default:
+			break;
+	}
+
+	// The FE connection failed: the FE answered with an error, it closed the connection, or it did not answer in time.
+	unsigned int err = mysql_errno(mc->mysql);
+	std::string errmsg = err ? mysql_error(mc->mysql) : "";
+	std::string sqlstate = err ? mysql_sqlstate(mc->mysql) : "HY000";
+	if (err == 0) {
+		err = 9002;
+		errmsg = "timeout while logging in to the StarRocks FE";
+	}
+	const bool from_fe = (err < 2000 || err >= 3000);
+	if (!from_fe) {
+		errmsg = "ProxySQL: the connection to the StarRocks FE failed during the login: " + errmsg;
+		err = 2013;
+		sqlstate = "HY000";
+	}
+	const std::string fe_address = std::string(mc->parent->address) + ":" + std::to_string(mc->parent->port);
+	myds->destroy_MySQL_Connection_From_Pool(false);
+	switch (starrocks_login_phase) {
+		case STARROCKS_LOGIN_CONNECTING:
+			if (starrocks_login_retries > 0) {
+				// The client has no greeting yet, so another FE can take its login.
+				starrocks_login_retries--;
+				proxy_warning("StarRocks FE %s failed before the greeting of client %s:%d: %s. Trying another FE\n",
+					fe_address.c_str(), client_myds->addr.addr, client_myds->addr.port, errmsg.c_str());
+				if (mysql_thread___connect_retries_delay) {
+					pause_until = thread->curtime + mysql_thread___connect_retries_delay * 1000;
+				}
+				return 0;
+			}
+			starrocks_login_fail(from_fe ? err : 9001, from_fe ? sqlstate.c_str() : "HY000",
+				(from_fe ? errmsg : "ProxySQL: cannot connect to a StarRocks FE: " + errmsg).c_str(), wrong_pass);
+			return 0;
+		case STARROCKS_LOGIN_GREETED:
+			// We tell the client when it answers.
+			starrocks_login_errno = err;
+			starrocks_login_sqlstate = sqlstate;
+			starrocks_login_error = errmsg;
+			starrocks_login_phase = STARROCKS_LOGIN_FAILED;
+			return 0;
+		default:
+			starrocks_login_fail(err, sqlstate.c_str(), errmsg.c_str(), wrong_pass);
+			return 0;
+	}
+}
+
+bool MySQL_Session::starrocks_rewrite_kill(PtrSize_t *pkt, bool query_only, unsigned int id) {
+	StarRocksKillTarget target;
+	MySQL_Connection *own = starrocks_relay_connection();
+	if (own == NULL || !starrocks_kill_lookup(id, target)) return false;
+	const std::string own_address = std::string(own->parent->address) + ":" + std::to_string(own->parent->port);
+	if (target.fe_address != own_address) {
+		// KILL by connection id is local to one FE: another FE would answer that the id does not exist.
+		// We cannot log in to the other FE for this client, so we say what is wrong.
+		std::string message;
+		string_format("ProxySQL: connection %d is on the StarRocks FE %s, and this connection is on %s. "
+			"The FE kills only its own connections", message, id, target.fe_address.c_str(), own_address.c_str());
+		client_myds->setDSS_STATE_QUERY_SENT_NET();
+		client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, 1, 1094, (char *)"HY000", message.c_str(), true);
+		client_myds->DSS = STATE_SLEEP;
+		RequestEnd(NULL, 1094, message.c_str());
+		l_free(pkt->size, pkt->ptr);
+		return true;
+	}
+	const std::string text = std::string(query_only ? "KILL QUERY " : "KILL CONNECTION ") + std::to_string(target.fe_connection_id);
+	PtrSize_t replacement;
+	replacement.size = sizeof(mysql_hdr) + 1 + text.size();
+	replacement.ptr = l_alloc(replacement.size);
+	memcpy(replacement.ptr, pkt->ptr, sizeof(mysql_hdr) + 1);
+	mysql_hdr header;
+	memcpy(&header, pkt->ptr, sizeof(header));
+	header.pkt_length = 1 + text.size();
+	memcpy(replacement.ptr, &header, sizeof(header));
+	memcpy(static_cast<char *>(replacement.ptr) + sizeof(mysql_hdr) + 1, text.data(), text.size());
+	l_free(pkt->size, pkt->ptr);
+	*pkt = replacement;
+	CurrentQuery.QueryLength = text.size();
+	CurrentQuery.QueryPointer = static_cast<unsigned char *>(pkt->ptr) + sizeof(mysql_hdr) + 1;
+	return false;
 }

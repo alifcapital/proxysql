@@ -449,6 +449,8 @@ MySQL_Connection::MySQL_Connection() {
 	myds=NULL;
 	inserted_into_pool=0;
 	reusable=false;
+	starrocks_relay=false;
+	memset(&relay, 0, sizeof(relay));
 	parent=NULL;
 	userinfo=new MySQL_Connection_userinfo();
 	fd=-1;
@@ -1062,6 +1064,16 @@ void MySQL_Connection::connect_start() {
 			auth_password=userinfo->password;
 		}
 	}
+	const char *auth_username = userinfo->username;
+	const char *auth_schemaname = userinfo->schemaname;
+	if (starrocks_relay) {
+		// We do not know the client yet. The library suspends the login after it
+		// has read the scramble of the FE, and relay_set_client() supplies the rest.
+		mysql_options(mysql, MARIADB_OPT_PROXYSQL_RELAY, &relay);
+		auth_username = "";
+		auth_password = (char *)"";
+		auth_schemaname = NULL;
+	}
 #ifdef PROXYSQLED25519
 	// Prefix match, not full-validity match: a "$ED$"-prefixed value of the
 	// wrong length is just as unusable as cleartext against a backend as a
@@ -1091,13 +1103,13 @@ void MySQL_Connection::connect_start() {
 #endif
 	if (parent->port) {
 		char* host_ip = connect_start_DNS_lookup();
-		async_exit_status=mysql_real_connect_start(&ret_mysql, mysql, host_ip, userinfo->username, auth_password, userinfo->schemaname, parent->port, NULL, client_flags);
+		async_exit_status=mysql_real_connect_start(&ret_mysql, mysql, host_ip, auth_username, auth_password, auth_schemaname, parent->port, NULL, client_flags);
 	} else {
 		const bool fast_forward = myds && myds->sess && myds->sess->session_fast_forward;
 		if (!fast_forward) {
 			client_flags &= ~(CLIENT_COMPRESS | CLIENT_ZSTD_COMPRESSION_ALGORITHM); // disabling compression for regular connections made via Unix socket
 		}
-		async_exit_status=mysql_real_connect_start(&ret_mysql, mysql, "localhost", userinfo->username, auth_password, userinfo->schemaname, parent->port, parent->address, client_flags);
+		async_exit_status=mysql_real_connect_start(&ret_mysql, mysql, "localhost", auth_username, auth_password, auth_schemaname, parent->port, parent->address, client_flags);
 	}
 	fd=mysql_get_socket(mysql);
 //	{
@@ -1117,6 +1129,42 @@ void MySQL_Connection::connect_start() {
 void MySQL_Connection::connect_cont(short event) {
 	proxy_debug(PROXY_DEBUG_MYSQL_PROTOCOL, 6,"event=%d\n", event);
 	async_exit_status = mysql_real_connect_cont(&ret_mysql, mysql, mysql_status(event, true));
+}
+
+void MySQL_Connection::relay_enable() {
+	starrocks_relay = true;
+	memset(&relay, 0, sizeof(relay));
+	// We never reset, reuse or return to the pool a connection that nobody but its client can authenticate.
+	reusable = false;
+	set_status(true, STATUS_MYSQL_CONNECTION_NO_MULTIPLEX);
+	set_status(true, STATUS_MYSQL_CONNECTION_NO_MULTIPLEX_HG);
+	// The SSL parameters of the server are looked up by user name, and the client is not known yet.
+	userinfo->set((char *)"", NULL, NULL, NULL);
+}
+
+void MySQL_Connection::relay_set_client(const char *user, const char *db, const unsigned char *response, unsigned int response_len) {
+	assert(starrocks_relay);
+	assert(relay.state == PROXYSQL_RELAY_SCRAMBLE_READY);
+	assert(response_len == 0 || response_len == sizeof(relay.response));
+	relay_user = user ? user : "";
+	relay.user = relay_user.c_str();
+	if (db) {
+		relay_db = db;
+		relay.db = relay_db.c_str();
+	} else {
+		relay.db = NULL;
+	}
+	// The charset and the client flags of the backend follow the client, like those of any other backend connection.
+	connect_start_SetCharset();
+	unsigned long client_flags = 0;
+	connect_start_SetClientFlag(client_flags);
+	relay.charset = mysql->charset;
+	relay.client_flag = client_flags;
+	if (response_len) {
+		memcpy(relay.response, response, response_len);
+	}
+	relay.response_len = response_len;
+	relay.state = PROXYSQL_RELAY_RESPONSE_SET;
 }
 
 void MySQL_Connection::change_user_start() {
@@ -3250,7 +3298,7 @@ void MySQL_Connection::reset() {
 	set_status(old_no_multiplex_hg,STATUS_MYSQL_CONNECTION_NO_MULTIPLEX_HG);
 	// reconfigure STATUS_MYSQL_CONNECTION_COMPRESSION
 	set_status(old_compress,STATUS_MYSQL_CONNECTION_COMPRESSION);
-	reusable=true;
+	reusable=!starrocks_relay;
 	options.last_set_autocommit=-1; // never sent
 	warning_count=0;
 	delete local_stmts;

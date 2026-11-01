@@ -1,0 +1,247 @@
+--- include/mysql.h
++++ include/mysql.h
+@@ -258,7 +258,8 @@
+     MARIADB_OPT_RPL_REGISTER_REPLICA,
+     MARIADB_OPT_STATUS_CALLBACK,
+     MARIADB_OPT_SERVER_PLUGINS,
+-    MARIADB_OPT_SSL_KEYLOG_CALLBACK
++    MARIADB_OPT_SSL_KEYLOG_CALLBACK,
++    MARIADB_OPT_PROXYSQL_RELAY
+   };
+ 
+   enum mariadb_value {
+@@ -900,8 +901,39 @@
+ /* new api functions */
+ 
+ #define HAVE_MYSQL_REAL_CONNECT
++
++/*
++  ProxySQL relay login.
++
++  We want the client of ProxySQL to answer the scramble of the server, so that
++  the server authenticates the client and ProxySQL needs no password. The
++  caller sets this structure with MARIADB_OPT_PROXYSQL_RELAY before a non
++  blocking mysql_real_connect_start(). The mysql_native_password plugin then
++  reads the scramble of the server, publishes it in 'scramble', sets 'state' to
++  PROXYSQL_RELAY_SCRAMBLE_READY and suspends the connect call, waiting for
++  READ events. The caller fills 'user', 'db', 'charset', 'client_flag',
++  'response' and 'response_len', sets 'state' to PROXYSQL_RELAY_RESPONSE_SET
++  and continues the connect call. If the call continues while 'state' is not
++  PROXYSQL_RELAY_RESPONSE_SET, the server closed the connection or sent
++  something unexpected, and the connect call fails.
++*/
++#define PROXYSQL_RELAY_IDLE 0
++#define PROXYSQL_RELAY_SCRAMBLE_READY 1
++#define PROXYSQL_RELAY_RESPONSE_SET 2
++#define PROXYSQL_RELAY_DONE 3
+ 
++typedef struct st_proxysql_relay {
++  int state;
++  unsigned char scramble[21];       /* out: scramble of the server, 20 bytes and 0 */
++  const char *user;                 /* in: user name of the client */
++  const char *db;                   /* in: default database, NULL for none */
++  const void *charset;              /* in: MARIADB_CHARSET_INFO of the client, or NULL */
++  unsigned long client_flag;        /* in: client flags added to the connection */
++  unsigned char response[20];       /* in: authentication response of the client */
++  unsigned int response_len;        /* in: 0 (no password) or 20 */
++} PROXYSQL_RELAY;
+ 
++
+ #ifdef	__cplusplus
+ }
+ #endif
+--- include/ma_common.h
++++ include/ma_common.h
+@@ -90,6 +90,7 @@
+   void (*status_callback)(void *ptr, enum enum_mariadb_status_info type, ...);
+   void *status_data;
+   my_bool tls_verify_server_cert;
++  PROXYSQL_RELAY *proxysql_relay;
+ };
+ 
+ typedef struct st_connection_handler
+--- libmariadb/mariadb_lib.c
++++ libmariadb/mariadb_lib.c
+@@ -3817,6 +3817,9 @@
+   case MARIADB_OPT_SSL_KEYLOG_CALLBACK:
+     OPT_SET_EXTENDED_VALUE(&mysql->options, ssl_keylog_callback, arg1);
+     break;
++  case MARIADB_OPT_PROXYSQL_RELAY:
++    OPT_SET_EXTENDED_VALUE(&mysql->options, proxysql_relay, arg1);
++    break;
+   case MYSQL_OPT_CONNECT_ATTR_DELETE:
+     {
+       uchar *h;
+--- plugins/auth/my_auth.c
++++ plugins/auth/my_auth.c
+@@ -3,7 +3,12 @@
+ #include <errmsg.h>
+ #include <string.h>
+ #include <ma_common.h>
++#include <ma_context.h>
+ #include <mysql/client_plugin.h>
++#ifndef _WIN32
++#include <sys/socket.h>
++#include <errno.h>
++#endif
+ 
+ typedef struct st_mysql_client_plugin_AUTHENTICATION auth_plugin_t;
+ static int client_mpvio_write_packet(struct st_plugin_vio*, const uchar*, size_t);
+@@ -53,11 +58,79 @@
+   native_password_auth_client
+ };
+ 
++
++/*
++  ProxySQL relay login (see PROXYSQL_RELAY in mysql.h).
++
++  We want the client of ProxySQL to answer the scramble of the server. So we
++  publish the scramble, suspend the connect call until the caller supplies the
++  answer, and send that answer as the authentication response. A connect call
++  that is not suspended cannot park, so we refuse to relay then.
++*/
++static PROXYSQL_RELAY *relay_of(MYSQL *mysql)
++{
++  return mysql->options.extension ? mysql->options.extension->proxysql_relay : NULL;
++}
++
++/*
++  Tells if the server sent data, or closed the connection, while we wait for
++  the caller. The server sends nothing before it gets the response.
++*/
++static my_bool relay_server_gone(MYSQL *mysql)
++{
++  char c;
++  my_socket sock;
++  ssize_t res;
++
++  if (!mysql->net.pvio || ma_pvio_get_handle(mysql->net.pvio, &sock))
++    return 1;
++  res= recv(sock, &c, 1, MSG_PEEK | MSG_DONTWAIT);
++  if (res >= 0)
++    return 1;
++  return errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR;
++}
++
++static int relay_park(MYSQL *mysql, PROXYSQL_RELAY *relay)
++{
++  struct mysql_async_context *b= mysql->options.extension->async_context;
++
++  if (!b || !b->active)
++  {
++    my_set_error(mysql, CR_UNKNOWN_ERROR, SQLSTATE_UNKNOWN,
++                 "ProxySQL relay login needs a non blocking connect");
++    return CR_ERROR;
++  }
++  relay->state= PROXYSQL_RELAY_SCRAMBLE_READY;
++  while (relay->state != PROXYSQL_RELAY_RESPONSE_SET)
++  {
++    b->events_to_wait_for= MYSQL_WAIT_READ;
++    if (b->suspend_resume_hook)
++      (*b->suspend_resume_hook)(TRUE, b->suspend_resume_hook_user_data);
++    my_context_yield(&b->async_context);
++    if (b->suspend_resume_hook)
++      (*b->suspend_resume_hook)(FALSE, b->suspend_resume_hook_user_data);
++    /*
++      The caller may continue us without a reason: it passes the events of the
++      socket to the call of every owner of the connection. So we look at the
++      socket ourselves, and wait again if the server did nothing.
++    */
++    if (relay->state != PROXYSQL_RELAY_RESPONSE_SET && relay_server_gone(mysql))
++    {
++      my_set_error(mysql, CR_SERVER_LOST, SQLSTATE_UNKNOWN,
++                          ER(CR_SERVER_LOST_EXTENDED),
++                          "waiting for the authentication response of the client",
++                          errno);
++      return CR_ERROR;
++    }
++  }
++  return CR_OK;
++}
+ 
+ static int native_password_auth_client(MYSQL_PLUGIN_VIO *vio, MYSQL *mysql)
+ {
+   int pkt_len;
+   uchar *pkt;
++  PROXYSQL_RELAY *relay= relay_of(mysql);
+ 
+   if (((MCPVIO_EXT *)vio)->mysql_change_user)
+   {
+@@ -80,6 +153,36 @@
+     /* save it in MYSQL */
+     memmove(mysql->scramble_buff, pkt, SCRAMBLE_LENGTH);
+     mysql->scramble_buff[SCRAMBLE_LENGTH] = 0;
++  }
++
++  if (relay && relay->state == PROXYSQL_RELAY_IDLE)
++  {
++    int rc;
++    memcpy(relay->scramble, pkt, SCRAMBLE_LENGTH);
++    relay->scramble[SCRAMBLE_LENGTH]= 0;
++    if ((rc= relay_park(mysql, relay)) != CR_OK)
++      return rc;
++
++    /*
++      The first packet we write is the handshake response. It carries the
++      identity of the client, which we know only now.
++    */
++    free(mysql->user);
++    mysql->user= strdup(relay->user ? relay->user : "");
++    if (!mysql->user)
++    {
++      my_set_error(mysql, CR_OUT_OF_MEMORY, SQLSTATE_UNKNOWN, 0);
++      return CR_ERROR;
++    }
++    ((MCPVIO_EXT *)vio)->db= relay->db;
++    if (relay->charset)
++      mysql->charset= (MARIADB_CHARSET_INFO *)relay->charset;
++    mysql->client_flag|= relay->client_flag;
++    relay->state= PROXYSQL_RELAY_DONE;
++    if (vio->write_packet(vio, relay->response_len ? relay->response : 0,
++                          relay->response_len))
++      return CR_ERROR;
++    return CR_OK;
+   }
+ 
+   if (mysql && mysql->passwd[0])
+@@ -637,6 +740,24 @@
+ 
+   mysql->net.last_errno= 0; /* just in case */
+ 
++  /*
++    A relayed connection has no password, so only the first login with
++    mysql_native_password can succeed. We fear that any other login would send
++    an empty password, so we refuse it.
++  */
++  if (relay_of(mysql))
++  {
++    if (relay_of(mysql)->state != PROXYSQL_RELAY_IDLE ||
++        auth_plugin != &mysql_native_password_client_plugin)
++    {
++      my_set_error(mysql, 1045, "28000",
++                   "ProxySQL: the StarRocks FE asks for the authentication plugin '%s'; "
++                   "only mysql_native_password is supported when ProxySQL relays the login",
++                   auth_plugin_name);
++      return 1;
++    }
++  }
++
+   if (data_plugin && strcmp(data_plugin, auth_plugin_name))
+   {
+     /* data was prepared for a different plugin, so we don't
+@@ -707,6 +828,15 @@
+   if (mysql->net.read_pos[0] == 254)
+   {
+     /* The server asked to use a different authentication plugin */
++    if (relay_of(mysql))
++    {
++      /* The server asks for another plugin, for which we have no password. */
++      my_set_error(mysql, 1045, "28000",
++                   "ProxySQL: the StarRocks FE asks for the authentication plugin '%s' for this user; "
++                   "only mysql_native_password is supported when ProxySQL relays the login",
++                   pkt_length > 1 ? (char*)mysql->net.read_pos + 1 : "mysql_old_password");
++      return 1;
++    }
+     if (pkt_length == 1)
+     {
+       /* old "use short scramble" packet */

@@ -1263,6 +1263,10 @@ bool MySQL_Protocol::generate_pkt_auth_switch_request(bool send, void **ptr, uns
 
 bool MySQL_Protocol::generate_pkt_initial_handshake(bool send, void **ptr, unsigned int *len, uint32_t *_thread_id, bool deprecate_eof_active) {
 	int use_plugin_id = mysql_thread___default_authentication_plugin_int;
+	if (use_preset_scramble) {
+		// The FE checks the response, and it offers mysql_native_password only.
+		use_plugin_id = 0;
+	}
   proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 7, "Generating handshake pkt\n");
 	assert(use_plugin_id == 0 || use_plugin_id == 2 ); // mysql_native_password or caching_sha2_password
   mysql_hdr myhdr;
@@ -1299,20 +1303,24 @@ bool MySQL_Protocol::generate_pkt_initial_handshake(bool send, void **ptr, unsig
 	*_thread_id=thread_id;
 
 	unsigned char scramble[20];
-	if (RAND_bytes(scramble, sizeof(scramble)) != 1) {
-		proxy_error("RAND_bytes() failed generating initial handshake scramble for thread %u\n", thread_id);
-		free(_ptr);
-		return false;
-	}
-	for (unsigned int i = 0; i < sizeof(scramble); i++) {
-		unsigned char c = scramble[i];
-		if (c > 127) {
-			c -= 128;
+	if (use_preset_scramble) {
+		memcpy((*myds)->myconn->scramble_buff, preset_scramble, sizeof(scramble));
+	} else {
+		if (RAND_bytes(scramble, sizeof(scramble)) != 1) {
+			proxy_error("RAND_bytes() failed generating initial handshake scramble for thread %u\n", thread_id);
+			free(_ptr);
+			return false;
 		}
-		if (c == 0) {
-			c = 'a';
+		for (unsigned int i = 0; i < sizeof(scramble); i++) {
+			unsigned char c = scramble[i];
+			if (c > 127) {
+				c -= 128;
+			}
+			if (c == 0) {
+				c = 'a';
+			}
+			(*myds)->myconn->scramble_buff[i] = c;
 		}
-		(*myds)->myconn->scramble_buff[i] = c;
 	}
 	(*myds)->myconn->scramble_buff[sizeof(scramble)] = '\0';
 
@@ -2254,6 +2262,7 @@ int MySQL_Protocol::PPHR_1(unsigned char *pkt, unsigned int len, bool& ret, MyPr
 #endif
 	) {
 		vars1.pass_len = payload_length;
+		vars1.pass_len_raw = payload_length;
 	} else {
 		const unsigned char* terminator = static_cast<const unsigned char *>(
 			std::memchr(pkt, '\0', payload_length)
@@ -2469,6 +2478,7 @@ bool MySQL_Protocol::PPHR_2(unsigned char *pkt, unsigned int len, bool& ret, MyP
 	} else {
 		vars1.db = NULL;
 	}
+	vars1.pass_len_raw = vars1.pass_len;
 	if (vars1.pass_len) {
 		if (vars1.pass[vars1.pass_len-1] == 0) {
 			vars1.pass_len--; // remove the extra 0 if present
@@ -2579,7 +2589,8 @@ bool MySQL_Protocol::PPHR_4auth0(unsigned char *pkt, unsigned int len, bool& ret
 		(*myds)->auth_in_progress = 1;
 		// check if user exists
 		bool user_exists = true;
-		if (GloMyLdapAuth) { // we check if user exists only if GloMyLdapAuth is enabled
+		// With the StarRocks FE authentication ProxySQL knows no users: the client always switches to mysql_native_password.
+		if (GloMyLdapAuth && !(*myds)->sess->starrocks_auth_session) { // we check if user exists only if GloMyLdapAuth is enabled
 #ifdef PROXYSQLCLICKHOUSE
 			enum proxysql_session_type session_type = (*myds)->sess->session_type;
 			if (session_type == PROXYSQL_SESSION_CLICKHOUSE) {
@@ -2610,7 +2621,7 @@ bool MySQL_Protocol::PPHR_4auth0(unsigned char *pkt, unsigned int len, bool& ret
 
 
 bool MySQL_Protocol::PPHR_4auth1(unsigned char *pkt, unsigned int len, bool& ret, MyProt_tmp_auth_vars& vars1) {
-	if (GloMyLdapAuth) {
+	if (GloMyLdapAuth && !(*myds)->sess->starrocks_auth_session) {
 		if ((*myds)->switching_auth_stage == 0) {
 			bool user_exists = true;
 #ifdef PROXYSQLCLICKHOUSE
@@ -3218,6 +3229,32 @@ bool MySQL_Protocol::PPHR_passthrough_init(MyProt_tmp_auth_vars& vars1) {
 
 	// Any other stage is a protocol bug; assert in debug builds.
 	assert(0);
+	return false;
+}
+
+bool MySQL_Protocol::PPHR_starrocks_relay(MyProt_tmp_auth_vars& vars1) {
+	MySQL_Session *s = (*myds)->sess;
+	s->starrocks_login_user = vars1.user ? reinterpret_cast<const char *>(vars1.user) : "";
+	s->starrocks_login_has_db = (vars1.db != NULL);
+	s->starrocks_login_db = vars1.db ? vars1.db : "";
+	s->starrocks_login_response_len = 0;
+	s->starrocks_login_rejected = false;
+	// The FE computes the expected response from its scramble with mysql_native_password, so
+	// any other plugin, or a response of another length, can never be right.
+	if (auth_plugin_id != AUTH_MYSQL_NATIVE_PASSWORD) {
+		s->starrocks_login_rejected = true;
+		s->starrocks_login_reject_message =
+			"ProxySQL: the StarRocks FE authenticates this login, so only mysql_native_password is supported";
+	} else if (vars1.pass_len_raw != 0 && vars1.pass_len_raw != sizeof(s->starrocks_login_response)) {
+		s->starrocks_login_rejected = true;
+		s->starrocks_login_reject_message =
+			"ProxySQL: malformed mysql_native_password response";
+	} else if (vars1.pass_len_raw != 0) {
+		memcpy(s->starrocks_login_response, vars1.pass, sizeof(s->starrocks_login_response));
+		s->starrocks_login_response_len = sizeof(s->starrocks_login_response);
+	}
+	s->starrocks_login_response_ready = true;
+	(*myds)->auth_in_progress = 1;
 	return false;
 }
 
@@ -4014,6 +4051,11 @@ __do_auth:
 		}
 		// set the default session charset
 		(*myds)->sess->default_charset = vars1.charset;
+	}
+	if ((*myds)->sess->starrocks_auth_session && session_type == PROXYSQL_SESSION_MYSQL) {
+		// The FE authenticates the client: ProxySQL looks up no account.
+		ret = PPHR_starrocks_relay(vars1);
+		goto __exit_do_auth;
 	}
 	if (session_type == PROXYSQL_SESSION_CLICKHOUSE) {
 #ifdef PROXYSQLCLICKHOUSE

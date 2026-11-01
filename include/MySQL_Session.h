@@ -608,6 +608,76 @@ class MySQL_Session: public Base_Session<MySQL_Session, MySQL_Data_Stream, MySQL
 	 */
 	bool passthrough_connect_in_flight;
 	/**
+	 * @brief True when the StarRocks FE authenticates the client of this session.
+	 * @details Set when the client connects while @c mysql-starrocks_auth_hostgroup is 0 or more.
+	 *  ProxySQL holds no password for such a client. The FE connection that took its login
+	 *  belongs to the session for its whole life, and the session ends when that connection ends or its FE leaves.
+	 */
+	bool starrocks_auth_session;
+	/**
+	 * @brief Step of the login of a client whom the StarRocks FE authenticates.
+	 * @details The session status stays CONNECTING_CLIENT during all steps.
+	 */
+	enum starrocks_login_phase_t {
+		STARROCKS_LOGIN_NONE = 0,       ///< not logging in (not a StarRocks FE authentication session, or logged in)
+		STARROCKS_LOGIN_CONNECTING,     ///< connecting to an FE; its scramble is not known, the client has not got a greeting
+		STARROCKS_LOGIN_GREETED,        ///< the client got the greeting with the scramble of the FE; we wait for its response
+		STARROCKS_LOGIN_RESPONDED,      ///< the FE connection has the response of the client; we wait for the verdict of the FE
+		STARROCKS_LOGIN_FAILED          ///< the FE connection failed after the greeting; we wait for the response of the client to answer it
+	};
+	starrocks_login_phase_t starrocks_login_phase;
+	/// Number of times we may still try another FE while the client has no greeting.
+	int starrocks_login_retries;
+	/// Identity and authentication response of the client, set by MySQL_Protocol::PPHR_starrocks_relay().
+	std::string starrocks_login_user;
+	std::string starrocks_login_db;
+	bool starrocks_login_has_db;
+	unsigned char starrocks_login_response[20];
+	unsigned int starrocks_login_response_len;
+	bool starrocks_login_response_ready;
+	/// True when the response cannot be relayed; 'starrocks_login_reject_message' tells why.
+	bool starrocks_login_rejected;
+	std::string starrocks_login_reject_message;
+	/// The error that the FE connection reported while the client had no verdict yet.
+	unsigned int starrocks_login_errno;
+	std::string starrocks_login_sqlstate;
+	std::string starrocks_login_error;
+	/// True when the session must end as soon as its client has read all output.
+	bool starrocks_close_after_output;
+	/// True while this session is in the table that maps the connection id of ProxySQL to the FE connection id.
+	bool starrocks_kill_registered;
+	/**
+	 * @brief Lets KILL of a client work without a password.
+	 * @details A client sees the connection id of ProxySQL and sends KILL [QUERY] id over a new connection, which
+	 *  logged in as the same user on its own FE connection. We rewrite the statement to the FE connection id of
+	 *  the target session, so the FE runs it on that new connection and applies its own privilege rules.
+	 *  An id that is not in the table is left as it is, and the FE answers it with its own error.
+	 * @return True when the client has its answer. False when the (rewritten) packet goes to the FE.
+	 */
+	bool starrocks_rewrite_kill(PtrSize_t *pkt, bool query_only, unsigned int id);
+	/**
+	 * @brief Runs one step of the login of a client whom the StarRocks FE authenticates.
+	 * @param wrong_pass Set to true when the client got an error and the session must end after it is sent.
+	 * @return -1 when the session must end now, 0 otherwise.
+	 */
+	int handler_starrocks_login(bool& wrong_pass);
+	void starrocks_login_fail(unsigned int err, const char *sqlstate, const char *message, bool& wrong_pass);
+	void starrocks_login_complete(bool& wrong_pass);
+	/// Returns the FE connection that took the login of the client, or NULL if the session has none.
+	MySQL_Connection *starrocks_relay_connection();
+	/// Tells if the FE connection of the session is gone or its FE is not ONLINE.
+	bool starrocks_fe_left();
+	/// Opens the FE connection for the login. Returns false when it fails; the client then got an error.
+	bool starrocks_login_open(bool& wrong_pass);
+	/// Gives the response of the client to the FE connection, which was waiting for it.
+	void starrocks_login_feed(bool& wrong_pass);
+	/**
+	 * @brief Tells if a session of a client whom the StarRocks FE authenticates must end now.
+	 * @details It must end when its FE connection is gone, or its FE is not ONLINE, and the client has
+	 *  read the response of the last request. A request that runs finishes on its FE first.
+	 */
+	bool starrocks_session_must_end();
+	/**
 	 * @brief Failure channel from CONNECTING_SERVER back to the pass-through
 	 * Phase B handler.
 	 *

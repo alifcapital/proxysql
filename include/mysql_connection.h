@@ -89,6 +89,8 @@ class MySQL_Connection {
 	unsigned long long inserted_into_pool;
 	void connect_start_SetAttributes();
 	void connect_start_SetCharset();
+	std::string relay_user; // owned copies of the strings that 'relay' points to
+	std::string relay_db;
 	void connect_start_SetClientFlag(unsigned long&);
 	char * connect_start_DNS_lookup();
 	void connect_start_SetSslSettings();
@@ -200,6 +202,31 @@ class MySQL_Connection {
 	bool processing_multi_statement;
 	bool multiplex_delayed;
 	bool unknown_transaction_status;
+	/**
+	 * @brief True when the StarRocks FE authenticates the client of this connection.
+	 * @details We want such a connection to belong to one client for its whole life. ProxySQL has no
+	 *  password for it, so the pool must never reset, reuse or reconnect it.
+	 */
+	bool starrocks_relay;
+	/**
+	 * @brief State of the relayed login, shared with the MariaDB client library.
+	 * @details The library publishes the scramble of the FE here and waits until relay_set_client()
+	 *  supplies the authentication response of the client.
+	 */
+	PROXYSQL_RELAY relay;
+	/**
+	 * @brief Marks the connection as the relay connection of one client.
+	 * @details Must be called before the first handler() call.
+	 */
+	void relay_enable();
+	/**
+	 * @brief Hands the identity and the authentication response of the client to the FE login.
+	 * @param user User name of the client.
+	 * @param db Default database, or NULL for none.
+	 * @param response Authentication response of the client, 20 bytes or empty.
+	 * @param response_len 0 or 20.
+	 */
+	void relay_set_client(const char *user, const char *db, const unsigned char *response, unsigned int response_len);
 	void compute_unknown_transaction_status();
 	char gtid_uuid[128];
 

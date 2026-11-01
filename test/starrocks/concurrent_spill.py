@@ -111,7 +111,7 @@ def main():
                              if inode not in baseline and data["bytes"] > 0}
                     if len(files) >= args.clients:
                         evidence = files
-                    return len(files) >= args.clients and suite.used() == 0
+                    return len(files) >= args.clients and suite.backends_idle()
                 eventually(paused_complete, config.get("timeout", 120))
                 assert len(evidence) >= args.clients, "clients shared a spool inode"
                 assert len({data["inode"] for data in evidence.values()}) == len(evidence), "simultaneous clients shared a spool inode"
@@ -165,7 +165,7 @@ def main():
                     pending.extend(workers.submit(consume, client) for client in replacement)
                 record["results"] = dict(future.result() for future in pending)
                 suite.cleanup()
-                eventually(lambda: suite.used() == 0)
+                eventually(suite.backends_idle)
                 assert inventory(suite) == baseline
                 record["rss_peak"] = peak[0]
                 assert peak[0] - before <= config.get("maximum_aggregate_rss_growth_bytes", 128 << 20), (before, peak[0])

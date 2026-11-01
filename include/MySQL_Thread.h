@@ -615,6 +615,7 @@ class MySQL_Threads_Handler
 		bool resultset_spill_enabled;
 		char *resultset_spill_directory;
 		int resultset_spill_limit;
+		int starrocks_auth_hostgroup;
 		int query_digests_max_digest_length;
 		int query_digests_max_query_length;
 		int query_rules_fast_routing_algorithm;

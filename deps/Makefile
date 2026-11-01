@@ -304,6 +304,8 @@ endif
 	cd mariadb-client-library/mariadb_client && patch -p0 < ../mariadb_lib.c.metadata_column_check.patch
 	# new compilers fix
 	cd mariadb-client-library/mariadb_client && patch -p0 < ../bool_keyword.patch
+	# relay of the client login to the server (StarRocks FE authentication in ProxySQL)
+	cd mariadb-client-library/mariadb_client && patch -p0 < ../proxysql_relay.patch
 
 	cd mariadb-client-library/mariadb_client && CC=${CC} CXX=${CXX} ${MAKE} mariadbclient VERBOSE=1
 #	cd mariadb-client-library/mariadb_client/include && make my_config.h

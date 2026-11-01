@@ -124,6 +124,7 @@ class MyProt_tmp_auth_vars {
 	uint32_t  capabilities = 0;
 	uint32_t  max_pkt;
 	uint32_t  pass_len = 0;
+	uint32_t  pass_len_raw = 0; // length of the authentication response as the client sent it, before any trailing 0 is dropped
 	uint8_t zstd_compression_level = 0;
 	bool use_ssl = false;
 	bool use_zstd_compression = false;
@@ -159,6 +160,13 @@ class MySQL_Protocol {
 	enum proxysql_auth_plugins auth_plugin_id;
 	uint16_t prot_status;
 	bool more_data_needed;
+	/**
+	 * @brief Scramble that generate_pkt_initial_handshake() sends instead of a random one.
+	 * @details Set when the StarRocks FE authenticates the client: the client must answer the scramble of
+	 *  the FE, because the FE checks the answer. The greeting then offers mysql_native_password only.
+	 */
+	bool use_preset_scramble = false;
+	unsigned char preset_scramble[20];
 #ifdef PROXYSQL31
 	std::shared_ptr<const MySQL_Caching_Sha2_RSA_Key_Snapshot> caching_sha2_rsa_snapshot_;
 	MySQLFrontendAuthError frontend_auth_error_ { MySQLFrontendAuthError::NONE };
@@ -229,6 +237,14 @@ class MySQL_Protocol {
 	 * @return False when the request packet could not be allocated; no auth state is advanced.
 	 */
 	bool PPHR_passthrough_init(MyProt_tmp_auth_vars& vars1);
+	/**
+	 * @brief Takes the identity and the authentication response of a client whom the StarRocks FE authenticates.
+	 * @details ProxySQL has no password for the client, so it does not check the response. It keeps the
+	 *  user, the database and the response in the session, which hands them to the FE connection.
+	 *  A response that the FE cannot check against its scramble is marked as rejected in the session.
+	 * @return False, because the login is not complete until the FE answers.
+	 */
+	bool PPHR_starrocks_relay(MyProt_tmp_auth_vars& vars1);
 	void PPHR_7auth1(bool& ret, MyProt_tmp_auth_vars& vars1, char * reply, account_details_t& attr1);
 	void PPHR_7auth2(bool& ret, MyProt_tmp_auth_vars& vars1, char * reply, account_details_t& attr1);
 	void PPHR_next_auth_stage(MyProt_tmp_auth_vars& vars1, PASSWORD_TYPE::E passtype);

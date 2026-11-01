@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Verify an in-flight query survives FE drain and both new/old clients use the other FE."""
+"""Verify an in-flight query survives FE drain and new clients use the other FE.
+
+With ProxySQL authentication the existing client continues on the other FE. When
+config["fe_auth"] is true the FE authenticated the client, so ProxySQL closes the
+client connection after the response of the running query instead.
+"""
 import argparse
 from concurrent.futures import ThreadPoolExecutor
 import json
@@ -36,14 +41,18 @@ def run(config):
             assert sql(newcomer, "SELECT 'new-client-on-new-fe'") == ((b"new-client-on-new-fe",),)
             assert_migrated(admin, config, before)
             assert running.result(timeout=30) == expected, "old FE response was lost or changed during drain"
-            before = query_counts(admin, config)
-            assert sql(client, "SELECT 'existing-client-on-new-fe'") == ((b"existing-client-on-new-fe",),)
-            assert_migrated(admin, config, before)
+            if config.get("fe_auth"):
+                client._sock.settimeout(20)
+                assert client._sock.recv(1) == b"", "the client stayed on the drained FE"
+            else:
+                before = query_counts(admin, config)
+                assert sql(client, "SELECT 'existing-client-on-new-fe'") == ((b"existing-client-on-new-fe",),)
+                assert_migrated(admin, config, before)
         print("# old query completed; new and existing frontend connections used the other FE", flush=True)
     finally:
         if newcomer is not None:
             newcomer.close()
-        if client is not None:
+        if client is not None and client.open:
             client.close()
         for host, port, status in statuses:
             sql(admin, "UPDATE mysql_servers SET status=%s WHERE hostgroup_id=%s AND hostname=%s AND port=%s",

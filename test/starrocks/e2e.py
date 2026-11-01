@@ -123,6 +123,18 @@ class Suite:
         return any(row[5] == b"Query" and (row[9] or b"").startswith(marker)
                    for row in sql(self.direct, "SHOW PROCESSLIST"))
 
+    def backends_idle(self):
+        """No FE connection is busy with a fixture query.
+
+        A multiplexed client gives its FE connection back to the pool, so ConnUsed is 0. A sticky
+        client (and any client of the FE authentication) keeps it, so the FE tells whether a
+        fixture query still runs. All fixture queries read TABLE(generate_series(...)).
+        """
+        if not self.c.get("sticky_connection"):
+            return self.used() == 0
+        return not any(row[5] == b"Query" and b"generate_series" in (row[9] or b"")
+                       for row in sql(self.direct, "SHOW PROCESSLIST"))
+
     def cleanup(self):
         eventually(lambda: self.spill_fds() == self.baseline_fds)
 

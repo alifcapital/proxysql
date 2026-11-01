@@ -465,6 +465,7 @@ static char * mysql_thread_variables_names[]= {
 	(char *)"resultset_spill_enabled",
 	(char *)"resultset_spill_directory",
 	(char *)"resultset_spill_limit",
+	(char *)"starrocks_auth_hostgroup",
 	(char *)"query_digests_max_digest_length",
 	(char *)"query_digests_max_query_length",
 	(char *)"query_digests_grouping_limit",
@@ -1417,6 +1418,7 @@ MySQL_Threads_Handler::MySQL_Threads_Handler() {
 	variables.resultset_spill_enabled=false;
 	variables.resultset_spill_directory=strdup("/tmp");
 	variables.resultset_spill_limit=0; // Zero means no configured disk limit.
+	variables.starrocks_auth_hostgroup=-1; // -1: ProxySQL authenticates the clients itself
 	variables.query_digests_max_digest_length=2*1024;
 	variables.query_digests_max_query_length=65000; // legacy default
 	variables.query_rules_fast_routing_algorithm=1;
@@ -3078,6 +3080,7 @@ char ** MySQL_Threads_Handler::get_variables_list() {
 		VariablesPointers_int["threshold_query_length"]    = make_tuple(&variables.threshold_query_length,    1024, 1*1024*1024*1024, false);
 		VariablesPointers_int["threshold_resultset_size"]  = make_tuple(&variables.threshold_resultset_size,  1024, 1*1024*1024*1024, false);
 		VariablesPointers_int["resultset_spill_limit"] = make_tuple(&variables.resultset_spill_limit, 0, INT_MAX, false);
+		VariablesPointers_int["starrocks_auth_hostgroup"] = make_tuple(&variables.starrocks_auth_hostgroup, -1, INT_MAX, false);
 
 		// variables with special variable == true
 		// the input validation for these variables MUST be EXPLICIT
@@ -5009,6 +5012,7 @@ void MySQL_Thread::refresh_variables() {
 	REFRESH_VARIABLE_BOOL(resultset_spill_enabled);
 	REFRESH_VARIABLE_CHAR(resultset_spill_directory);
 	REFRESH_VARIABLE_INT(resultset_spill_limit);
+	REFRESH_VARIABLE_INT(starrocks_auth_hostgroup);
 	REFRESH_VARIABLE_INT(query_digests_max_digest_length);
 	REFRESH_VARIABLE_INT(query_digests_max_query_length);
 	REFRESH_VARIABLE_INT(wait_timeout);
@@ -5409,7 +5413,18 @@ void MySQL_Thread::listener_handle_new_connection(MySQL_Data_Stream *myds, unsig
 			sess->client_myds->proxy_addr.addr=strdup(ifi->address);
 			sess->client_myds->proxy_addr.port=ifi->port;
 		}
-		if (sess->client_myds->myprot.generate_pkt_initial_handshake(true,NULL,NULL, &sess->thread_session_id, true) == false) {
+		const bool starrocks_auth = (mysql_thread___starrocks_auth_hostgroup >= 0);
+		if (starrocks_auth) {
+			// We want the FE to authenticate the client, so the greeting carries the scramble of an FE
+			// connection. The session sends it as soon as it has that scramble.
+			sess->starrocks_auth_session = true;
+			sess->starrocks_login_phase = MySQL_Session::STARROCKS_LOGIN_CONNECTING;
+			sess->starrocks_login_retries = mysql_thread___connect_retries_on_failure;
+			sess->default_hostgroup = mysql_thread___starrocks_auth_hostgroup;
+			sess->current_hostgroup = mysql_thread___starrocks_auth_hostgroup;
+			sess->status = CONNECTING_CLIENT;
+			sess->to_process = 1;
+		} else if (sess->client_myds->myprot.generate_pkt_initial_handshake(true,NULL,NULL, &sess->thread_session_id, true) == false) {
 			delete sess;
 			return;
 		}
@@ -5441,7 +5456,11 @@ void MySQL_Thread::listener_handle_new_connection(MySQL_Data_Stream *myds, unsig
 		// is done to prevent situations in which a client sends a packet *before* receiving
 		// this 'initial handshake', leading to invalid state in dataflow, since it will be
 		// data in both ends of the datastream. For more details see #3342.
-		sess->writeout();
+		// With the StarRocks FE authentication the session sends the greeting later, and the client
+		// has to wait for it.
+		if (!starrocks_auth) {
+			sess->writeout();
+		}
 	} else {
 		free(addr);
 		// if we arrive here, accept() failed

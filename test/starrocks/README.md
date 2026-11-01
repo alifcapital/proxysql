@@ -72,10 +72,6 @@ Implemented acceptance fixtures (execution results must be recorded separately):
   and contain only `backend`; `new_fe` is the second FE that each case adds when
   it switches.
 * `protocol_edges.py`: compressed raw pipelining and COM_QUIT with unread spill.
-* `compression_framing.py` reads a million short rows through a compressed connection with
-  mysql-connector-python and compares them with a direct FE. The result is spilled, and the
-  blocks of the spill have any size, so without the framer many compressed packets ended inside a
-  MySQL packet header and the driver failed every time. It works with every setup.
 * `large_packets.py`: large wire packets across the protocol packet boundary,
   with real spool-file and cleanup evidence. Its Python connector transport
   adapter joins compressed frames and binary row continuations that the pure
@@ -84,6 +80,55 @@ Implemented acceptance fixtures (execution results must be recorded separately):
   jar, including negotiated compression, server-side prepare and their combination.
 * `concurrent_spill.py`: eight simultaneous clients, bounded output, cleanup and
   concurrent cancellation/disconnect behavior, with a JSON evidence report.
+
+## StarRocks FE authentication
+
+`setup.py --fe-auth` configures ProxySQL for `mysql-starrocks_auth_hostgroup`: it sets
+the variable to the test hostgroup, leaves `mysql_users` empty and gives each server
+row 200 connections, because every client holds one FE connection. The clients log in
+as users of the FE (`root` without a password in `config.example.json`). It cannot be
+combined with `--baseline` or `--multiplexed`, and it writes `"fe_auth": true` to the
+JSON file. Start from a ProxySQL that has no pooled connections (restart it after a
+run with `--multiplexed`), because `fe_auth.py` checks that nothing goes to the pool.
+
+```sh
+python test/starrocks/setup.py --fe-auth --pid PROXYSQL_PID --output /tmp/starrocks-test.json --spill-directory /tmp/private-spill
+python test/starrocks/fe_auth.py /tmp/starrocks-test.json --connector-jar /path/to/mysql-connector-j-8.0.33.jar
+```
+
+* `fe_auth.py` creates its own FE users (a user with a password, one with an empty
+  password and one with the LDAP plugin) through `config["backend"]`, which must be
+  allowed to run `CREATE USER`, and drops them at the end. It checks: login with a
+  right and a wrong password, an unknown user and an empty password, where the error
+  of the client must equal the error of a direct FE login; a database at login; the
+  error for a user that needs another plugin; TLS, zlib compression, the `mysql`
+  command line client (plain, TLS, compressed, with an authentication switch),
+  Connector/J (plain, TLS, compressed, prepared); that every client holds its own FE
+  connection and none is pooled or reused; the error of `COM_CHANGE_USER` and
+  `COM_RESET_CONNECTION`; that a killed FE connection closes the client; the error
+  when no FE is `ONLINE`; that clients which leave during the login leave no FE
+  connection. It also checks `KILL QUERY id` and `KILL id` from a second connection of
+  the same user (the way the `mysql` client and Connector/J cancel), `Statement.cancel()`
+  and `setQueryTimeout()` of Connector/J, that the FE answers a `KILL` of a session of
+  another user and of an unknown id with its own error, and that a query stops on the
+  FE when its client closes the socket. These cases run a query over
+  `TABLE(generate_series(1,100000000000))` on the compute nodes and look at the FE process
+  list; each case fails if a query from an earlier case still runs. The command line client and Connector/J cases are marked SKIP when the
+  client or the jar is missing; a SKIP is not a pass.
+* `sticky_switch.py` and `upgrade_drain.py` read `fe_auth` from the JSON file. In
+  that mode a running query finishes on the drained FE and the client gets the whole
+  result, then ProxySQL closes the client connection; an idle client and an open
+  transaction are closed too; and a new connection lands on the `ONLINE` FE.
+* `compression_framing.py` reads a million short rows through a compressed connection with
+  mysql-connector-python and compares them with a direct FE. The result is spilled, and the
+  blocks of the spill have any size, so without the fix many compressed packets ended inside a
+  MySQL packet header and the driver failed every time. It works with every setup.
+* `transactions.py` sends statements around explicit transactions (after a user variable or
+  `SET autocommit=0`, `COMMIT`, `ROLLBACK`) and fails if one gets no answer. It runs
+  against the sticky setup and against `--fe-auth`.
+* `e2e.py`, `large_packets.py`, `large_packets_jdbc.py`, `protocol_edges.py` and
+  `concurrent_spill.py` run unchanged against the same setup. The two last ones wait
+  for the FE query to end, as the clients keep their FE connections.
 
 Additional commands for dedicated isolated listeners:
 
@@ -97,10 +142,10 @@ python test/starrocks/large_packets_jdbc.py --config /tmp/starrocks-test.json --
 `setup.py` gives the hostgroup `multiplex=0`, as the operator documentation
 prescribes, and records `sticky_connection` in the JSON file. `e2e.py`,
 `upgrade_drain.py` and `sticky_switch.py` are written for that mode.
-`protocol_edges.py` and `concurrent_spill.py` assert that the FE connection goes
-back to the pool while the client reads, or that a closed session leaves a
-reusable pooled connection, so run them against a hostgroup created with
-`setup.py --multiplexed`.
+`protocol_edges.py` and `concurrent_spill.py` wait until the FE query has ended while
+the client has not read the result. With a multiplexed hostgroup they see the FE
+connection go back to the pool (`ConnUsed` is 0); with a sticky one, or with the FE
+authentication, they look at the FE process list instead.
 
 Run fixtures serially when they share a listener or hostgroup: migration cases
 change server status. Presence of a fixture or an example command does not

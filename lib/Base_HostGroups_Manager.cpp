@@ -2122,6 +2122,13 @@ void MySQL_HostGroups_Manager::push_MyConn_to_pool(MySQL_Connection *c, bool _lo
 		goto __exit_push_MyConn_to_pool;
 	}
 
+	// A StarRocks relay connection belongs to the client that logged in on it, and ProxySQL has no
+	// password to log in again. So we never keep it for another client.
+	if (c->starrocks_relay) {
+		delete c;
+		goto __exit_push_MyConn_to_pool;
+	}
+
 	// If the largest query length exceeds the threshold, destroy the connection
 	if (c->largest_query_length > (unsigned int)GloMTH->variables.threshold_query_length) {
 		proxy_debug(PROXY_DEBUG_MYSQL_CONNPOOL, 7, "Destroying MySQL_Connection %p, server %s:%d with status %d . largest_query_length = %lu\n", c, mysrvc->address, mysrvc->port, (int)mysrvc->get_status(), c->largest_query_length);

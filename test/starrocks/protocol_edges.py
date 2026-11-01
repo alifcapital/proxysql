@@ -18,7 +18,7 @@ suite = Suite(config)
 
 def wait_spill():
     eventually(lambda: any(size > 0 for fd, size in suite.spill_fds().items()
-                           if fd not in suite.baseline_fds) and suite.used() == 0,
+                           if fd not in suite.baseline_fds) and suite.backends_idle(),
                config.get("timeout", 120))
 
 

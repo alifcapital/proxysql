@@ -1923,7 +1923,7 @@ void MySQL_Data_Stream::return_MySQL_Connection_To_Pool() {
 		}
 	}
 
-	if (!mc->reusable) {
+	if (!mc->reusable || mc->starrocks_relay) {
 		destroy_MySQL_Connection_From_Pool(true);
 		return;
 	}
