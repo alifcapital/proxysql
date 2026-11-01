@@ -2742,6 +2742,9 @@ bool MySQL_Connection::IsKnownActiveTransaction() {
 
 bool MySQL_Connection::IsActiveTransaction() {
 	bool ret=false;
+	if (status_flags & STATUS_MYSQL_CONNECTION_STARROCKS_TRANSACTION) {
+		return true;
+	}
 	if (mysql) {
 		ret = (mysql->server_status & SERVER_STATUS_IN_TRANS);
 		if (ret == false && (mysql)->net.last_errno && unknown_transaction_status == true) {
@@ -2789,14 +2792,18 @@ bool MySQL_Connection::IsAutoCommit() {
 	return ret;
 }
 
-bool MySQL_Connection::MultiplexDisabled(bool check_delay_token) {
+bool MySQL_Connection::MultiplexDisabled(bool check_delay_token, bool check_hostgroup_setting) {
 // status_flags stores information about the status of the connection
 // can be used to determine if multiplexing can be enabled or not
 	bool ret=false;
-	if (status_flags & (STATUS_MYSQL_CONNECTION_USER_VARIABLE | STATUS_MYSQL_CONNECTION_PREPARED_STATEMENT |
+	uint32_t pinning_flags = STATUS_MYSQL_CONNECTION_USER_VARIABLE | STATUS_MYSQL_CONNECTION_PREPARED_STATEMENT |
 		STATUS_MYSQL_CONNECTION_LOCK_TABLES | STATUS_MYSQL_CONNECTION_TEMPORARY_TABLE | STATUS_MYSQL_CONNECTION_GET_LOCK | STATUS_MYSQL_CONNECTION_NO_MULTIPLEX |
-		STATUS_MYSQL_CONNECTION_SQL_LOG_BIN0 | STATUS_MYSQL_CONNECTION_FOUND_ROWS | STATUS_MYSQL_CONNECTION_NO_MULTIPLEX_HG |
-		STATUS_MYSQL_CONNECTION_HAS_SAVEPOINT | STATUS_MYSQL_CONNECTION_HAS_WARNINGS) ) {
+		STATUS_MYSQL_CONNECTION_SQL_LOG_BIN0 | STATUS_MYSQL_CONNECTION_FOUND_ROWS |
+		STATUS_MYSQL_CONNECTION_HAS_SAVEPOINT | STATUS_MYSQL_CONNECTION_HAS_WARNINGS;
+	if (check_hostgroup_setting) {
+		pinning_flags |= STATUS_MYSQL_CONNECTION_NO_MULTIPLEX_HG;
+	}
+	if (status_flags & pinning_flags) {
 		ret=true;
 	}
 	if (check_delay_token && auto_increment_delay_token) return true;

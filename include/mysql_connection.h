@@ -26,6 +26,7 @@
 #define STATUS_MYSQL_CONNECTION_NO_MULTIPLEX_HG      0x00000400
 #define STATUS_MYSQL_CONNECTION_HAS_SAVEPOINT        0x00000800
 #define STATUS_MYSQL_CONNECTION_HAS_WARNINGS         0x00001000
+#define STATUS_MYSQL_CONNECTION_STARROCKS_TRANSACTION 0x00002000
 
 #include "Servers_SslParams.h"
 
@@ -284,7 +285,11 @@ class MySQL_Connection {
 	bool IsServerOffline();
 	bool IsAutoCommit();
 	bool AutocommitFalse_AndSavepoint();
-	bool MultiplexDisabled(bool check_delay_token = true);
+	/**
+	 * @param check_hostgroup_setting When false, the hostgroup attribute 'multiplex=0' is not counted as a reason
+	 *  to disable multiplexing, so the result tells whether the connection state alone pins the session to it.
+	 */
+	bool MultiplexDisabled(bool check_delay_token = true, bool check_hostgroup_setting = true);
 	bool IsKeepMultiplexEnabledVariables(char *query_digest_text);
 	void ProcessQueryAndSetStatusFlags(char *query_digest_text, bool user_variable_usage_is_safe);
 	void optimize();

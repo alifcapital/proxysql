@@ -1,0 +1,15 @@
+{
+  "admin": {"host": "127.0.0.1", "port": 6032, "user": "admin", "password": "admin"},
+  "proxy": {"host": "127.0.0.1", "port": 6033, "user": "root", "password": ""},
+  "backend": {"host": "192.0.2.10", "port": 9030, "user": "root", "password": ""},
+  "new_fe": {"host": "192.0.2.11", "port": 9030},
+  "hostgroup": 41,
+  "proxysql_pid": 0,
+  "spill_file_marker": "proxysql",
+  "minimum_result_bytes": 67108864,
+  "maximum_rss_growth_bytes": 33554432,
+  "timeout": 120,
+  "protocol_variants": ["prepared", "compressed", "tls", "multi_results", "late_error"],
+  "tls_options": {"ssl_verify_cert": false},
+  "result_query": "SELECT generate_series, REPEAT(CONCAT(LPAD(generate_series, 10, '0'), '0123456789abcdef'), 160) FROM TABLE(generate_series(1, 32768)) ORDER BY generate_series"
+}

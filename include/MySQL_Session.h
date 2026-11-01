@@ -427,6 +427,17 @@ class MySQL_Session: public Base_Session<MySQL_Session, MySQL_Data_Stream, MySQL
 	size_t user_variable_replay_batch_index { 0 };
 	std::optional<UserVariableSetAnalysis> pending_user_variable_set;
 	bool current_query_user_variable_safe { false };
+	bool starrocks_backend_enabled();
+	bool starrocks_hostgroup_enabled(int hostgroup);
+	/**
+	 * @brief Releases the idle backend connection of a StarRocks hostgroup whose server is not ONLINE.
+	 * @details The release happens only if the connection holds no transaction and no other session state
+	 *  (the hostgroup attribute 'multiplex=0' alone does not count). The next statement of the session then
+	 *  gets a connection to an ONLINE server.
+	 * @return True if the connection was released.
+	 */
+	bool starrocks_release_offline_backend(MySQL_Data_Stream *myds);
+	void starrocks_release_offline_backends();
 	bool current_query_user_variable_unsafe_fallback { false };
 	bool current_query_user_variable_context_change { false };
 	bool user_variable_tracking_latched { false };

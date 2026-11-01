@@ -1,5 +1,9 @@
 #include "../deps/json/json.hpp"
 #include <atomic>
+#include <cctype>
+#include <cstring>
+#include <string>
+#include <vector>
 using json = nlohmann::json;
 #define PROXYJSON
 
@@ -81,6 +85,57 @@ using json = nlohmann::json;
 
 using std::function;
 using std::vector;
+
+// Returns the first words of a statement in upper case, skipping whitespace and comments.
+static std::vector<std::string> starrocks_leading_words(const char* sql, size_t length, size_t limit) {
+	std::vector<std::string> words;
+	for (size_t pos = 0; pos < length && words.size() < limit;) {
+		if (isspace(static_cast<unsigned char>(sql[pos]))) { ++pos; continue; }
+		if (pos + 1 < length && sql[pos] == '/' && sql[pos+1] == '*') {
+			pos += 2;
+			while (pos + 1 < length && !(sql[pos] == '*' && sql[pos+1] == '/')) ++pos;
+			pos += 2; continue;
+		}
+		if (sql[pos] == '#' || (pos + 1 < length && sql[pos] == '-' && sql[pos+1] == '-')) {
+			while (pos < length && sql[pos] != '\n') ++pos;
+			continue;
+		}
+		if (!isalpha(static_cast<unsigned char>(sql[pos]))) break;
+		std::string word;
+		while (pos < length && (isalnum(static_cast<unsigned char>(sql[pos])) || sql[pos] == '_'))
+			word += static_cast<char>(toupper(static_cast<unsigned char>(sql[pos++])));
+		words.push_back(std::move(word));
+	}
+	return words;
+}
+
+// StarRocks keeps an explicit transaction in the FE connection but does not
+// report it in the OK packet status flags, so we follow the statements ourselves.
+// Returns 1 if the text begins a transaction, -1 if it ends one and 0 otherwise.
+// We fear that a COMMIT hidden in a literal of a multi-statement text would make
+// us treat a transaction as finished while it is open, so a multi-statement
+// text can only begin a transaction, never end one.
+static int starrocks_transaction_command(const char* sql, size_t length) {
+	const auto classify = [](const char* text, size_t size) {
+		const std::vector<std::string> words = starrocks_leading_words(text, size, 2);
+		if (words.empty()) return 0;
+		if (words[0] == "BEGIN" || (words[0] == "START" && words.size() == 2 && words[1] == "TRANSACTION")) return 1;
+		if (words[0] == "COMMIT" || words[0] == "ROLLBACK") return -1;
+		return 0;
+	};
+	const char* first_end = static_cast<const char*>(memchr(sql, ';', length));
+	if (!first_end) return classify(sql, length);
+	size_t rest = static_cast<size_t>(first_end - sql) + 1;
+	while (rest < length && isspace(static_cast<unsigned char>(sql[rest]))) ++rest;
+	if (rest == length) return classify(sql, static_cast<size_t>(first_end - sql));
+	for (size_t pos = 0; pos < length;) {
+		if (classify(sql + pos, length - pos) == 1) return 1;
+		const char* separator = static_cast<const char*>(memchr(sql + pos, ';', length - pos));
+		if (!separator) break;
+		pos = static_cast<size_t>(separator - sql) + 1;
+	}
+	return 0;
+}
 
 static inline char is_digit(char c) {
 	if(c >= '0' && c <= '9')
@@ -4302,6 +4357,11 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 			}
 		}
 
+		if (starrocks_backend_enabled()) {
+			// We want to follow BEGIN and COMMIT sent as prepared statements, so we keep the text of the statement.
+			CurrentQuery.QueryPointer = (unsigned char*)stmt_info->query;
+			CurrentQuery.QueryLength = stmt_info->query_length;
+		}
 		rc_break=handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_qpo(&pkt, &lock_hostgroup, ps_type_execute_stmt);
 		if (rc_break==true) {
 			return;
@@ -5084,6 +5144,9 @@ __get_pkts_from_client:
 							break;
 					case STATE_SLEEP:	// only this section can be executed ALSO by mirror
 						command_counters->incr(thread->curtime/1000000);
+						if (mirror == false && session_type == PROXYSQL_SESSION_MYSQL && session_fast_forward == SESSION_FORWARD_TYPE_NONE) {
+							starrocks_release_offline_backends();
+						}
 						if (transaction_persistent_hostgroup==-1) {
 							if (mysql_thread___set_query_lock_on_hostgroup == 0) { // behavior before 2.0.6
 								current_hostgroup=default_hostgroup;
@@ -5845,6 +5908,7 @@ void MySQL_Session::handler_minus1_HandleBackendConnection(MySQL_Data_Stream *my
 		} else {
 			myconn->async_state_machine=ASYNC_IDLE;
 			myds->DSS=STATE_MARIADB_GENERIC;
+			starrocks_release_offline_backend(myds);
 		}
 	}
 }
@@ -6384,6 +6448,17 @@ handler_again:
 							assert(0);
 							break;
 							// LCOV_EXCL_STOP
+					}
+
+					if (myconn->parent->myhgc->attributes.starrocks_backend &&
+						(status == PROCESSING_QUERY || status == PROCESSING_STMT_EXECUTE)) {
+						// The FE does not report an open transaction in the OK packet, so we
+						// flag the connection as in a transaction from BEGIN until COMMIT or ROLLBACK.
+						const int transaction = starrocks_transaction_command(
+							(const char*)CurrentQuery.QueryPointer, CurrentQuery.QueryLength);
+						if (transaction != 0) {
+							myconn->set_status(transaction > 0, STATUS_MYSQL_CONNECTION_STARROCKS_TRANSACTION);
+						}
 					}
 
 					if (mysql_thread___log_mysql_warnings_enabled) {
@@ -9653,6 +9728,7 @@ void MySQL_Session::finishQuery(MySQL_Data_Stream *myds, MySQL_Connection *mycon
 								}
 							}
 						}
+						starrocks_release_offline_backend(myds);
 					}
 }
 
@@ -9992,4 +10068,47 @@ bool MySQL_Session::handle_session_track_capabilities() {
 	}
 
 	return true;
+}
+
+bool MySQL_Session::starrocks_backend_enabled() {
+    const int hostgroup = qpo && qpo->destination_hostgroup >= 0 && transaction_persistent_hostgroup == -1
+        ? qpo->destination_hostgroup : current_hostgroup;
+    return starrocks_hostgroup_enabled(hostgroup);
+}
+
+bool MySQL_Session::starrocks_hostgroup_enabled(int hostgroup) {
+    if (hostgroup < 0) return false;
+    MyHGM->wrlock();
+    MyHGC* group = MyHGM->MyHGC_find(hostgroup);
+    const bool enabled = group && group->attributes.starrocks_backend;
+    MyHGM->wrunlock();
+    return enabled;
+}
+
+// StarRocks hostgroups use multiplex=0, so a session keeps its connection
+// between statements. We fear that a frontend set to OFFLINE_SOFT would then
+// keep its sessions forever and could never be drained. So when the request has
+// ended and the connection is idle, we release it if its server is not ONLINE
+// and the connection holds no transaction and no other session state. We return
+// the connection to the pool because the pool destroys connections of servers
+// that are not ONLINE, so the old connection is never reused.
+bool MySQL_Session::starrocks_release_offline_backend(MySQL_Data_Stream *myds) {
+	if (mirror || myds == NULL || myds->myconn == NULL) return false;
+	MySQL_Connection *conn = myds->myconn;
+	if (!conn->parent->myhgc->attributes.starrocks_backend) return false;
+	if (conn->parent->get_status() == MYSQL_SERVER_STATUS_ONLINE) return false;
+	if (conn->async_state_machine != ASYNC_IDLE || !conn->reusable) return false;
+	if (conn->IsActiveTransaction() || conn->MultiplexDisabled(true, false)) return false;
+	myds->wait_until = 0;
+	conn->multiplex_delayed = false;
+	myds->DSS = STATE_NOT_INITIALIZED;
+	myds->return_MySQL_Connection_To_Pool();
+	return true;
+}
+
+void MySQL_Session::starrocks_release_offline_backends() {
+	for (unsigned int i = 0; i < mybes->len; i++) {
+		MySQL_Backend *backend = (MySQL_Backend *)mybes->index(i);
+		starrocks_release_offline_backend(backend->server_myds);
+	}
 }

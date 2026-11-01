@@ -318,6 +318,7 @@ class BaseHGC {	// MySQL Host Group Container
 		int8_t free_connections_pct;
 		int8_t handle_warnings;
 		bool multiplex;
+		bool starrocks_backend = false;
 		bool connection_warming;
 		bool configured; // this variable controls if attributes are configured or not. If not configured, they do not apply
 		bool initialized; // this variable controls if attributes were ever configured or not. Used by reset_attributes()
