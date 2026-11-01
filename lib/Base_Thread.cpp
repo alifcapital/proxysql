@@ -486,10 +486,11 @@ bool Base_Thread::set_backend_to_be_skipped_if_frontend_is_slow(DS * myds, unsig
 				return true;
 			}
 		} else if constexpr (std::is_same_v<T, MySQL_Thread>) {
-			unsigned int buffered_data = 0;
-			buffered_data = myds->sess->client_myds->PSarrayOUT->len * RESULTSET_BUFLEN;
+			uint64_t buffered_data = myds->sess->client_myds->output_memory_bytes();
 			buffered_data += myds->sess->client_myds->resultset->len * RESULTSET_BUFLEN;
-			if (buffered_data > overflow_safe_multiply<4,unsigned int>(mysql_thread___threshold_resultset_size)) {
+			uint64_t budget = static_cast<uint64_t>(mysql_thread___threshold_resultset_size) *
+				(mysql_thread___resultset_spill_enabled ? 2 : 4);
+			if (buffered_data > budget) {
 				thr->mypolls.fds[n].events = 0;
 				return true;
 			}
@@ -516,6 +517,9 @@ bool Base_Thread::set_backend_to_be_skipped_if_frontend_is_slow(DS * myds, unsig
 template<typename T, typename DS>
 bool Base_Thread::move_session_to_idle_mysql_sessions(DS * myds, unsigned int n) {
 	T* thr = static_cast<T*>(this);
+	if constexpr (std::is_same_v<T, MySQL_Thread>) {
+		if (myds->spill_serialize_commands && myds->PSarrayIN && myds->PSarrayIN->len) return false;
+	}
 	unsigned long long _tmp_idle = thr->mypolls.last_recv[n] > thr->mypolls.last_sent[n] ? thr->mypolls.last_recv[n] : thr->mypolls.last_sent[n] ;
 
 	int session_idle_ms = 0;
@@ -532,6 +536,11 @@ bool Base_Thread::move_session_to_idle_mysql_sessions(DS * myds, unsigned int n)
 		// make sure data stream has no pending data out and session is not throttled (#1939)
 		// because epoll thread does not handle data stream with data out
 		if (myds->sess->client_myds == myds && !myds->available_data_out() && myds->sess->pause_until <= curtime) {
+			if constexpr (std::is_same_v<T, MySQL_Thread>) {
+				// A drained spool still owns a wake descriptor for this worker.
+				// Cancel it before handing the session to a different thread.
+				myds->result_spool.reset(); myds->result_spill_eligible = false;
+			}
 			//unsigned int j;
 			bool has_backends = myds->sess->has_any_backend();
 			if (has_backends==false) {

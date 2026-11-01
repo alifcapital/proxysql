@@ -18,8 +18,10 @@ public:
 
 	bool set(uint64_t user_hash, const unsigned char* kp, uint32_t kl, unsigned char* vp, uint32_t vl, 
 		uint64_t create_ms, uint64_t curtime_ms, uint64_t expire_ms, bool deprecate_eof_active);
-	unsigned char* get(uint64_t user_hash, const unsigned char* kp, const uint32_t kl, uint32_t* lv, 
-		uint64_t curtime_ms, uint64_t cache_ttl, bool deprecate_eof_active);
+	/** @brief Copy a cached response, returning a miss before allocation if the
+	 * converted wire response exceeds maxcopy_size (zero means unlimited). */
+	unsigned char* get(uint64_t user_hash, const unsigned char* kp, const uint32_t kl, uint32_t* lv,
+		uint64_t curtime_ms, uint64_t cache_ttl, bool deprecate_eof_active, uint32_t maxcopy_size = 0);
 	//void* purgeHash_thread(void*);
 };
 

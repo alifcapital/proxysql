@@ -2,6 +2,7 @@
 #define PROXYSQL_MYSQL_DATA_STREAM_H
 
 #include <memory>
+#include <deque>
 #include <string>
 #include <utility>
 #include <vector>
@@ -10,6 +11,8 @@
 #include "cpp.h"
 
 #include "MySQL_Protocol.h"
+#include "MySQL_ResultSpool.h"
+#include "MySQL_Packet_Framer.h"
 #include "proxy_protocol_info.h"
 
 #ifndef PROXYJSON
@@ -124,6 +127,32 @@ class MySQL_Data_Stream
 
 	PtrSizeArray *PSarrayIN;
 	PtrSizeArray *PSarrayOUT;
+	// Producer packets and disk readback stay separate: readback must never be
+	// enqueued onto disk a second time, including when compression is enabled.
+	std::unique_ptr<MySQL_ResultSpool> result_spool;
+	PtrSizeArray spill_read_output;
+	size_t spill_packet_offset = 0;
+	// A client that compresses the connection gets one compressed packet per disk block. We do not want a
+	// compressed packet to end inside the header of a MySQL packet, so the first bytes of such a header wait
+	// here for the next block (see MySQL_Packet_Framer).
+	MySQL_Packet_Framer spill_framer;
+	std::vector<unsigned char> spill_header_carry;
+	bool result_spill_eligible = false;
+	// A session that opted into spilling serializes incoming commands through
+	// response drain, including compressed sequence IDs parked with each packet.
+	bool spill_serialize_commands = false;
+	uint8_t spill_received_compression_id = 0;
+	std::deque<uint8_t> spill_input_compression_ids;
+	/** @brief Hand off bounded producer bytes and collect disk readback. */
+	bool spill_output();
+	/** @brief Consume a worker completion and arrange session processing. */
+	bool spill_completed_event();
+	/** @brief Whether a spool still owns response bytes. */
+	bool spill_pending() const;
+	/** @brief Whether bytes are ready to send without waiting for disk IO. */
+	bool spill_wire_ready() const;
+	/** @brief Actual resident outgoing bytes, excluding disk storage. */
+	uint64_t output_memory_bytes() const;
 	FixedSizeQueue data_packets_history_IN;
 	FixedSizeQueue data_packets_history_OUT;
 	//PtrSizeArray *PSarrayOUTpending;

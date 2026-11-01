@@ -574,7 +574,8 @@ Query_Cache<QC_DERIVED>::~Query_Cache() {
 
 template <typename QC_DERIVED>
 std::shared_ptr<QC_entry_t> Query_Cache<QC_DERIVED>::get(uint64_t user_hash, const unsigned char *kp, 
-	const uint32_t kl, uint64_t curtime_ms, uint64_t cache_ttl) {
+	const uint32_t kl, uint64_t curtime_ms, uint64_t cache_ttl,
+	const std::function<bool(const QC_entry_t&)>& accept) {
 	
 	uint64_t hk=SpookyHash::Hash64(kp, kl, user_hash);
 	uint8_t i=hk%SHARED_QUERY_CACHE_HASH_TABLES;
@@ -582,6 +583,9 @@ std::shared_ptr<QC_entry_t> Query_Cache<QC_DERIVED>::get(uint64_t user_hash, con
 	std::shared_ptr<QC_entry_t> entry_shared = KVs[i]->lookup(hk).lock();
 
 	if (entry_shared) {
+		// Rejected entries count as misses and do not update access, soft TTL
+		// refresh state, hit counters, or bytes-out accounting.
+		if (accept && !accept(*entry_shared)) return {};
 		uint64_t t = curtime_ms;
 		if (entry_shared->expire_ms > t && entry_shared->create_ms + cache_ttl > t) {
 			if (

@@ -1322,6 +1322,9 @@ __thread bool mysql_thread___ffto_enabled;
 __thread int mysql_thread___ffto_max_buffer_size;
 #endif
 __thread int mysql_thread___threshold_resultset_size;
+__thread bool mysql_thread___resultset_spill_enabled;
+__thread char *mysql_thread___resultset_spill_directory;
+__thread int mysql_thread___resultset_spill_limit;
 __thread int mysql_thread___wait_timeout;
 __thread int mysql_thread___throttle_max_bytes_per_second_to_client;
 __thread int mysql_thread___throttle_ratio_server_to_client;
@@ -1679,6 +1682,9 @@ extern __thread bool mysql_thread___ffto_enabled;
 extern __thread int mysql_thread___ffto_max_buffer_size;
 #endif
 extern __thread int mysql_thread___threshold_resultset_size;
+extern __thread bool mysql_thread___resultset_spill_enabled;
+extern __thread char *mysql_thread___resultset_spill_directory;
+extern __thread int mysql_thread___resultset_spill_limit;
 extern __thread int mysql_thread___wait_timeout;
 extern __thread int mysql_thread___throttle_max_bytes_per_second_to_client;
 extern __thread int mysql_thread___throttle_ratio_server_to_client;

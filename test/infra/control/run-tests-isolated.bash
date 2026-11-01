@@ -200,7 +200,7 @@ if [ "${SKIP_PROXYSQL}" = "1" ]; then
     PROXYSQL_BIN="${WORKSPACE}/src/proxysql"
     PROXYSQL_VERSION=""
     if [ -x "${PROXYSQL_BIN}" ]; then
-        PROXYSQL_VERSION=$(${PROXYSQL_BIN} --version 2>&1 | grep -oP 'ProxySQL version \K[0-9]+\.[0-9]+\.[0-9]+' || true)
+        PROXYSQL_VERSION=$(${PROXYSQL_BIN} --version 2>&1 | grep -oP 'ProxySQL version v?\K[0-9]+\.[0-9]+\.[0-9]+' || true)
         echo ">>> Detected ProxySQL version: ${PROXYSQL_VERSION}"
     else
         echo ">>> WARNING: ProxySQL binary not found at ${PROXYSQL_BIN}, skipping version filtering"
@@ -208,13 +208,16 @@ if [ "${SKIP_PROXYSQL}" = "1" ]; then
 
     # Extract test names belonging to this group, filtering by @proxysql_min_version
     TEST_NAMES=$(python3 -c "
-import json, sys
+import json, os, re, sys
 from packaging import version
 proxysql_ver = '${PROXYSQL_VERSION}'
+include_pattern = os.environ.get('TEST_PY_TAP_INCL', '')
 with open('${GROUPS_JSON}') as f:
     groups = json.load(f)
 for test_name, test_groups in sorted(groups.items()):
     if '${TAP_GROUP}' in test_groups:
+        if include_pattern and not re.search(include_pattern, test_name):
+            continue
         # Check @proxysql_min_version tag
         skip = False
         if proxysql_ver:

@@ -35,6 +35,7 @@
 
 #include <cstring>
 #include <cstdlib>
+#include <vector>
 
 // Extern declarations for Glo* pointers (defined in test_globals.cpp)
 extern MySQL_Query_Cache *GloMyQC;
@@ -259,7 +260,8 @@ static void test_pgsql_flush() {
  * @brief Helper to extract a named stat value from SQL3_getStats().
  * @return The stat value as uint64_t, or 0 if not found.
  */
-static uint64_t get_qc_stat(PgSQL_Query_Cache *qc, const char *name) {
+template <typename Cache>
+static uint64_t get_qc_stat(Cache *qc, const char *name) {
 	SQLite3_result *result = qc->SQL3_getStats();
 	if (result == nullptr) {
 		return 0;
@@ -480,12 +482,69 @@ static void test_pgsql_many_entries() {
 		"PgSQL QC: flush() returns count >= N after bulk insert");
 }
 
+/** @brief Enforce the spill RAM budget before cached wire copies or conversions. */
+static void test_mysql_bounded_cache_copy() {
+	std::vector<unsigned char> wire;
+	uint8_t sid = 1;
+	auto packet = [&](std::vector<unsigned char> payload) {
+		wire.push_back(payload.size() & 255); wire.push_back((payload.size() >> 8) & 255);
+		wire.push_back((payload.size() >> 16) & 255); wire.push_back(sid++);
+		wire.insert(wire.end(), payload.begin(), payload.end());
+	};
+	packet({1});
+	packet({3,'d','e','f',0,0,0,1,'v',0,12,63,0,1,0,0,0,253,0,0,0,0,0});
+	packet({254,0,0,2,0}); packet({1,'x'}); packet({254,0,0,2,0});
+	const unsigned char* key = reinterpret_cast<const unsigned char*>("SELECT bounded cache");
+	uint32_t key_size = strlen(reinterpret_cast<const char*>(key));
+	uint64_t time = now_ms();
+	unsigned char* owned = static_cast<unsigned char*>(malloc(wire.size()));
+	memcpy(owned, wire.data(), wire.size());
+	ok(GloMyQC->set(90000,key,key_size,owned,wire.size(),time,time,time+60000,false),
+		"MySQL QC: seed complete classic EOF response");
+	uint64_t gets = get_qc_stat(GloMyQC,"Query_Cache_count_GET");
+	uint64_t hits = get_qc_stat(GloMyQC,"Query_Cache_count_GET_OK");
+	uint64_t bytes = get_qc_stat(GloMyQC,"Query_Cache_bytes_OUT");
+	uint32_t size = 0;
+	unsigned char* result = GloMyQC->get(90000,key,key_size,&size,time,60000,false,wire.size()-1);
+	ok(!result && get_qc_stat(GloMyQC,"Query_Cache_count_GET") == gets+1 &&
+		get_qc_stat(GloMyQC,"Query_Cache_count_GET_OK") == hits &&
+		get_qc_stat(GloMyQC,"Query_Cache_bytes_OUT") == bytes,
+		"MySQL QC: oversized copy counts as miss without bytes-out or hit accounting");
+	free(result);
+	result = GloMyQC->get(90000,key,key_size,&size,time,60000,false,wire.size());
+	ok(result && size == wire.size() && !memcmp(result,wire.data(),size),
+		"MySQL QC: exact RAM budget returns unchanged classic wire response");
+	free(result);
+	result = GloMyQC->get(90000,key,key_size,&size,time,60000,true,wire.size()-7);
+	ok(result && size == wire.size()-7, "MySQL QC: EOF-to-OK conversion uses actual smaller copy size");
+	std::vector<unsigned char> converted;
+	if (result) converted.assign(result,result+size);
+	free(result);
+	result = GloMyQC->get(90000,key,key_size,&size,time,60000,true,wire.size()-8);
+	ok(!result, "MySQL QC: converted response larger than RAM budget returns miss");
+	free(result);
+	result = GloMyQC->get(90000,key,key_size,&size,time,60000,false);
+	ok(result && size == wire.size(), "MySQL QC: unlimited legacy lookup still returns oversized cache entry");
+	free(result);
+	if (!converted.empty()) {
+		owned = static_cast<unsigned char*>(malloc(converted.size())); memcpy(owned,converted.data(),converted.size());
+		GloMyQC->set(90001,key,key_size,owned,converted.size(),time,time,time+60000,true);
+	}
+	result = GloMyQC->get(90001,key,key_size,&size,time,60000,false,converted.size());
+	ok(!result, "MySQL QC: OK-to-EOF growth is checked before allocating converted response");
+	free(result);
+	result = GloMyQC->get(90001,key,key_size,&size,time,60000,false,wire.size());
+	ok(result && size == wire.size() && !memcmp(result,wire.data(),size),
+		"MySQL QC: OK-to-EOF response at exact RAM budget preserves wire bytes");
+	free(result);
+}
+
 // ============================================================================
 // Main
 // ============================================================================
 
 int main() {
-	plan(26);
+	plan(34);
 
 	test_init_minimal();
 	test_init_query_cache();
@@ -506,6 +565,8 @@ int main() {
 	test_pgsql_many_entries();          // 2 tests
 	// Total: 26 ... let me recount
 	// 4+1+2+2+1+1+2+2+2+3+3+1+2 = 26
+
+	test_mysql_bounded_cache_copy();     // 8 tests
 
 	test_cleanup_query_cache();
 	test_cleanup_minimal();

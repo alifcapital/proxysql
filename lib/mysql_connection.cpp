@@ -1652,10 +1652,11 @@ handler_again:
 			PROXY_TRACE2();
 			{ // this copied mostly from ASYNC_USE_RESULT_CONT
 				if (myds->sess && myds->sess->client_myds && myds->sess->mirror==false) {
-					unsigned int buffered_data=0;
-					buffered_data = myds->sess->client_myds->PSarrayOUT->len * RESULTSET_BUFLEN;
+					uint64_t buffered_data = myds->sess->client_myds->output_memory_bytes();
 					buffered_data += myds->sess->client_myds->resultset->len * RESULTSET_BUFLEN;
-					if (buffered_data > overflow_safe_multiply<8,unsigned int>(mysql_thread___threshold_resultset_size)) {
+					uint64_t budget = static_cast<uint64_t>(mysql_thread___threshold_resultset_size) *
+						(mysql_thread___resultset_spill_enabled ? 2 : 8);
+					if (buffered_data > budget) {
 						next_event(ASYNC_STMT_EXECUTE_STORE_RESULT_CONT); // we temporarily pause . See #1232
 						break;
 					}
@@ -1680,9 +1681,9 @@ handler_again:
 					}
 					if (rows_read_inner > 1) {
 						process_rows_in_ASYNC_STMT_EXECUTE_STORE_RESULT_CONT(processed_bytes);
-						bool suspend_resultset_fetch = (processed_bytes > overflow_safe_multiply<8,unsigned int>(mysql_thread___threshold_resultset_size));
+						bool suspend_resultset_fetch = (processed_bytes > static_cast<uint64_t>(mysql_thread___threshold_resultset_size) * (mysql_thread___resultset_spill_enabled ? 1 : 8));
 
-						if (suspend_resultset_fetch == true && myds->sess && myds->sess->qpo && myds->sess->qpo->cache_ttl > 0) {
+						if (!mysql_thread___resultset_spill_enabled && suspend_resultset_fetch == true && myds->sess && myds->sess->qpo && myds->sess->qpo->cache_ttl > 0) {
 							suspend_resultset_fetch = (processed_bytes > ((uint64_t)mysql_thread___query_cache_size_MB) * 1024ULL * 1024ULL);
 						}
 
@@ -1837,10 +1838,11 @@ handler_again:
 			{
 				if (myds->sess && myds->sess->client_myds && myds->sess->mirror==false &&
 					myds->sess->status != SHOW_WARNINGS) { // see issue#4072
-					unsigned int buffered_data=0;
-					buffered_data = myds->sess->client_myds->PSarrayOUT->len * RESULTSET_BUFLEN;
+					uint64_t buffered_data = myds->sess->client_myds->output_memory_bytes();
 					buffered_data += myds->sess->client_myds->resultset->len * RESULTSET_BUFLEN;
-					if (buffered_data > overflow_safe_multiply<8,unsigned int>(mysql_thread___threshold_resultset_size)) {
+					uint64_t budget = static_cast<uint64_t>(mysql_thread___threshold_resultset_size) *
+						(mysql_thread___resultset_spill_enabled ? 2 : 8);
+					if (buffered_data > budget) {
 						next_event(ASYNC_USE_RESULT_CONT); // we temporarily pause . See #1232
 						break;
 					}
@@ -1894,9 +1896,9 @@ handler_again:
 					bytes_info.bytes_recv += br;
 					processed_bytes+=br;	// issue #527 : this variable will store the amount of bytes processed during this event
 
-					bool suspend_resultset_fetch = (processed_bytes > overflow_safe_multiply<8,unsigned int>(mysql_thread___threshold_resultset_size));
+					bool suspend_resultset_fetch = (processed_bytes > static_cast<uint64_t>(mysql_thread___threshold_resultset_size) * (mysql_thread___resultset_spill_enabled ? 1 : 8));
 
-					if (suspend_resultset_fetch == true && myds->sess && myds->sess->qpo && myds->sess->qpo->cache_ttl > 0) {
+					if (!mysql_thread___resultset_spill_enabled && suspend_resultset_fetch == true && myds->sess && myds->sess->qpo && myds->sess->qpo->cache_ttl > 0) {
 						suspend_resultset_fetch = (processed_bytes > ((uint64_t)mysql_thread___query_cache_size_MB) * 1024ULL * 1024ULL);
 					}
 

@@ -39,12 +39,14 @@ extern "C" char * sha256_crypt_r (const char *key, const char *salt, char *buffe
 uint8_t mysql_encode_length(uint64_t len, char *hd);
 
 
-MySQL_ResultSet::MySQL_ResultSet() {
-	buffer = NULL;
-	//reset_pid = true;
+MySQL_ResultSet::MySQL_ResultSet()
+	: deprecate_eof_active(false), transfer_started(false), resultset_completed(false),
+	  sid(0), myds(nullptr), myprot(nullptr), mysql(nullptr), result(nullptr), stmt(nullptr),
+	  num_fields(0), num_rows(0), resultset_size(0), buffer(nullptr), buffer_used(0) {
 }
 
 void MySQL_ResultSet::buffer_init(MySQL_Protocol* myproto) {
+	myds = nullptr;
 	if (buffer==NULL) {
 		buffer=(unsigned char *)malloc(RESULTSET_BUFLEN);
 	}
@@ -496,6 +498,7 @@ bool MySQL_ResultSet::get_COM_FIELD_LIST_response(PtrSizeArray *PSarrayFinal) {
 
 bool MySQL_ResultSet::get_resultset(PtrSizeArray *PSarrayFinal) {
 	transfer_started=true;
+	if (myds) myds->result_spill_eligible = true;
 	if (myprot) {
 		PSarrayFinal->copy_add(&PSarrayOUT,0,PSarrayOUT.len);
 		while (PSarrayOUT.len)

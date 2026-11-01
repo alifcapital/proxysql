@@ -5031,7 +5031,39 @@ __get_pkts_from_client:
 	//     process mirror only status==WAITING_CLIENT_DATA
 	for (unsigned int j=0; j< ( client_myds->PSarrayIN ? client_myds->PSarrayIN->len : 0)  || (mirror==true && status==WAITING_CLIENT_DATA) ;) {
 		if (mirror==false) {
+			if (session_type == PROXYSQL_SESSION_MYSQL && !session_fast_forward &&
+			    (mysql_thread___resultset_spill_enabled || client_myds->spill_serialize_commands)) {
+				client_myds->spill_serialize_commands = true;
+				// Keep pipelined requests queued while their preceding response is
+				// being produced or drained. This also prevents a new command from
+				// changing compression/session state used by queued response bytes.
+				if (status != CONNECTING_CLIENT &&
+				    (status != WAITING_CLIENT_DATA || client_myds->available_data_out())) {
+					// COM_QUIT explicitly abandons the response. Do not retain
+					// spool files waiting for a client that will never read it.
+					const PtrSize_t* pending = client_myds->PSarrayIN->index(0);
+					if (pending->size == sizeof(mysql_hdr) + 1 &&
+					    static_cast<unsigned char*>(pending->ptr)[sizeof(mysql_hdr)] == _MYSQL_COM_QUIT) {
+						client_myds->PSarrayIN->remove_index(0, &pkt);
+						l_free(pkt.size, pkt.ptr);
+						if (GloMyLogger) GloMyLogger->log_audit_entry(PROXYSQL_MYSQL_AUTH_QUIT, this, NULL);
+						return -1;
+					}
+					break;
+				}
+				if (status == WAITING_CLIENT_DATA && !client_myds->spill_output()) return -1;
+			}
 			client_myds->PSarrayIN->remove_index(0,&pkt);
+			if (client_myds->spill_serialize_commands) {
+				// Later queued request headers must not replace the ID of this
+				// command's final packet (notably for multi-packet requests).
+				mysql_hdr header; memcpy(&header, pkt.ptr, sizeof(header));
+				client_myds->pkt_sid = header.pkt_id;
+			}
+			if (!client_myds->spill_input_compression_ids.empty()) {
+				client_myds->myconn->compression_pkt_id = client_myds->spill_input_compression_ids.front();
+				client_myds->spill_input_compression_ids.pop_front();
+			}
 		}
 
 		switch (status) {
@@ -8555,9 +8587,11 @@ bool MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 			&resbuf ,
 			thread->curtime/1000 ,
 			qpo->cache_ttl,
-			deprecate_eof_active
+			deprecate_eof_active,
+			mysql_thread___resultset_spill_enabled ? mysql_thread___threshold_resultset_size : 0
 		);
 		if (aa) {
+			client_myds->result_spill_eligible = true;
 			client_myds->buffer2resultset(aa,resbuf);
 			free(aa);
 			client_myds->PSarrayOUT->copy_add(client_myds->resultset,0,client_myds->resultset->len);
@@ -9363,6 +9397,10 @@ void MySQL_Session::Memory_Stats() {
 		}
 		if (client_myds->PSarrayIN) {
 			internal += client_myds->PSarrayIN->total_size();
+		}
+		if (client_myds->result_spool) {
+			internal += sizeof(MySQL_ResultSpool) + client_myds->result_spool->memory_bytes();
+			internal += client_myds->spill_read_output.total_size();
 		}
 		if (client_myds->PSarrayIN) {
 			if (session_fast_forward) {

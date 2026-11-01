@@ -1,6 +1,7 @@
 #ifndef PROXYSQL_QUERY_CACHE_H
 #define PROXYSQL_QUERY_CACHE_H
 #include "btree_map.h"
+#include <functional>
 #include "proxysql.h"
 #include "cpp.h"
 #include "prometheus/counter.h"
@@ -187,8 +188,9 @@ protected:
 
 	bool set(QC_entry_t* entry, uint64_t user_hash, const unsigned char *kp, uint32_t kl, unsigned char *vp,
 		uint32_t vl, uint64_t create_ms, uint64_t curtime_ms, uint64_t expire_ms);
-	std::shared_ptr<QC_entry_t> get(uint64_t user_hash, const unsigned char* kp, const uint32_t kl, 
-		uint64_t curtime_ms, uint64_t cache_ttl);
+	std::shared_ptr<QC_entry_t> get(uint64_t user_hash, const unsigned char* kp, const uint32_t kl,
+		uint64_t curtime_ms, uint64_t cache_ttl,
+		const std::function<bool(const QC_entry_t&)>& accept = {});
 	
 	constexpr static unsigned int purge_total_time = DEFAULT_purge_total_time;
 	constexpr static unsigned int purge_threshold_pct_min = DEFAULT_purge_threshold_pct_min;

@@ -263,11 +263,18 @@ bool MySQL_Query_Cache::set(uint64_t user_hash, const unsigned char* kp, uint32_
 }
 
 unsigned char* MySQL_Query_Cache::get(uint64_t user_hash, const unsigned char* kp, const uint32_t kl, uint32_t* lv, 
-	uint64_t curtime_ms, uint64_t cache_ttl, bool deprecate_eof_active) {
+	uint64_t curtime_ms, uint64_t cache_ttl, bool deprecate_eof_active, uint32_t maxcopy_size) {
 	unsigned char* result = NULL;
-
+	auto accept = [maxcopy_size, deprecate_eof_active](const QC_entry_t& value) {
+		if (!maxcopy_size) return true;
+		const auto& entry = static_cast<const MySQL_QC_entry_t&>(value);
+		int64_t size = entry.length;
+		if (deprecate_eof_active && entry.column_eof_pkt_offset) size += eof_to_ok_dif;
+		else if (!deprecate_eof_active && entry.ok_pkt_offset) size += ok_to_eof_dif;
+		return size >= 0 && static_cast<uint64_t>(size) <= maxcopy_size;
+	};
 	std::shared_ptr<MySQL_QC_entry_t> entry_shared = std::static_pointer_cast<MySQL_QC_entry_t>(
-		Query_Cache::get(user_hash, kp, kl, curtime_ms, cache_ttl)
+		Query_Cache::get(user_hash, kp, kl, curtime_ms, cache_ttl, accept)
 	);
 
 	if (entry_shared) {

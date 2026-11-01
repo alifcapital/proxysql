@@ -462,6 +462,9 @@ static char * mysql_thread_variables_names[]= {
 	(char *)"binlog_reader_connect_retry_msec",
 	(char *)"threshold_query_length",
 	(char *)"threshold_resultset_size",
+	(char *)"resultset_spill_enabled",
+	(char *)"resultset_spill_directory",
+	(char *)"resultset_spill_limit",
 	(char *)"query_digests_max_digest_length",
 	(char *)"query_digests_max_query_length",
 	(char *)"query_digests_grouping_limit",
@@ -1411,6 +1414,9 @@ MySQL_Threads_Handler::MySQL_Threads_Handler() {
 	variables.binlog_reader_connect_retry_msec=3000;
 	variables.threshold_query_length=512*1024;
 	variables.threshold_resultset_size=4*1024*1024;
+	variables.resultset_spill_enabled=false;
+	variables.resultset_spill_directory=strdup("/tmp");
+	variables.resultset_spill_limit=0; // Zero means no configured disk limit.
 	variables.query_digests_max_digest_length=2*1024;
 	variables.query_digests_max_query_length=65000; // legacy default
 	variables.query_rules_fast_routing_algorithm=1;
@@ -1952,6 +1958,7 @@ char * MySQL_Threads_Handler::get_variable_string(char *name) {
 	}
 	if (!strcmp(name,"server_version")) return strdup(variables.server_version);
 	if (!strcmp(name,"eventslog_filename")) return strdup(variables.eventslog_filename);
+	if (!strcmp(name,"resultset_spill_directory")) return strdup(variables.resultset_spill_directory);
 	if (!strcmp(name,"auditlog_filename")) return strdup(variables.auditlog_filename);
 	if (!strcmp(name,"interfaces")) return strdup(variables.interfaces);
 	if (!strcmp(name,"resolution_family")) return strdup(variables.resolution_family);
@@ -2125,6 +2132,7 @@ char * MySQL_Threads_Handler::get_variable(const char *name) {	// this is the pu
 	if (!strcasecmp(name,"server_version")) return strdup(variables.server_version);
 	if (!strcasecmp(name,"auditlog_filename")) return strdup(variables.auditlog_filename);
 	if (!strcasecmp(name,"eventslog_filename")) return strdup(variables.eventslog_filename);
+	if (!strcasecmp(name,"resultset_spill_directory")) return strdup(variables.resultset_spill_directory);
 	if (!strcasecmp(name,"default_schema")) return strdup(variables.default_schema);
 	if (!strcasecmp(name,"resolution_family")) return strdup(variables.resolution_family);
 	if (!strcasecmp(name,"keep_multiplexing_variables")) return strdup(variables.keep_multiplexing_variables);
@@ -2694,6 +2702,20 @@ bool MySQL_Threads_Handler::set_variable(const char *name, const char *value) {	
 		return true;
 	}
 
+	if (!strcasecmp(name,"resultset_spill_directory")) {
+		// Require an absolute directory so daemon chdir cannot change its meaning.
+		// Open/write errors remain checked by the spool worker at use time.
+		if (value[0] != '/') return false;
+		DIR *spill_dir = opendir(value);
+		if (!spill_dir) return false;
+		closedir(spill_dir);
+		char *replacement = strdup(value);
+		if (!replacement) return false;
+		free(variables.resultset_spill_directory);
+		variables.resultset_spill_directory = replacement;
+		return true;
+	}
+
 	if (!strcasecmp(name,"auditlog_filename")) {
                 if (value[strlen(value) - 1] == '/') {
                         proxy_error("%s is an invalid value for auditlog_filename, please specify a filename not just the path\n", value);
@@ -2868,6 +2890,7 @@ char ** MySQL_Threads_Handler::get_variables_list() {
 		VariablesPointers_bool["monitor_writer_is_also_reader"]   = make_tuple(&variables.monitor_writer_is_also_reader,   false);
 		VariablesPointers_bool["multiplexing"]                    = make_tuple(&variables.multiplexing,                    false);
 		VariablesPointers_bool["query_cache_stores_empty_result"] = make_tuple(&variables.query_cache_stores_empty_result, false);
+		VariablesPointers_bool["resultset_spill_enabled"] = make_tuple(&variables.resultset_spill_enabled, false);
 		VariablesPointers_bool["query_digests"]                   = make_tuple(&variables.query_digests,                   false);
 		VariablesPointers_bool["query_digests_lowercase"]         = make_tuple(&variables.query_digests_lowercase,         false);
 		VariablesPointers_bool["query_digests_replace_null"]      = make_tuple(&variables.query_digests_replace_null,      false);
@@ -3054,6 +3077,7 @@ char ** MySQL_Threads_Handler::get_variables_list() {
 
 		VariablesPointers_int["threshold_query_length"]    = make_tuple(&variables.threshold_query_length,    1024, 1*1024*1024*1024, false);
 		VariablesPointers_int["threshold_resultset_size"]  = make_tuple(&variables.threshold_resultset_size,  1024, 1*1024*1024*1024, false);
+		VariablesPointers_int["resultset_spill_limit"] = make_tuple(&variables.resultset_spill_limit, 0, INT_MAX, false);
 
 		// variables with special variable == true
 		// the input validation for these variables MUST be EXPLICIT
@@ -3526,6 +3550,7 @@ MySQL_Threads_Handler::~MySQL_Threads_Handler() {
 	if (variables.add_ldap_user_comment) free(variables.add_ldap_user_comment);
 	if (variables.default_session_track_gtids) free(variables.default_session_track_gtids);
 	if (variables.eventslog_filename) free(variables.eventslog_filename);
+	if (variables.resultset_spill_directory) free(variables.resultset_spill_directory);
 	if (variables.auditlog_filename) free(variables.auditlog_filename);
 	if (variables.ssl_p2s_ca) free(variables.ssl_p2s_ca);
 	if (variables.ssl_p2s_capath) free(variables.ssl_p2s_capath);
@@ -3669,6 +3694,7 @@ MySQL_Thread::~MySQL_Thread() {
 	}
 
 	if (mysql_thread___eventslog_filename) { free(mysql_thread___eventslog_filename); mysql_thread___eventslog_filename=NULL; }
+	if (mysql_thread___resultset_spill_directory) { free(mysql_thread___resultset_spill_directory); mysql_thread___resultset_spill_directory=NULL; }
 	if (mysql_thread___auditlog_filename) { free(mysql_thread___auditlog_filename); mysql_thread___auditlog_filename=NULL; }
 	if (mysql_thread___ssl_p2s_ca) { free(mysql_thread___ssl_p2s_ca); mysql_thread___ssl_p2s_ca=NULL; }
 	if (mysql_thread___ssl_p2s_capath) { free(mysql_thread___ssl_p2s_capath); mysql_thread___ssl_p2s_capath=NULL; }
@@ -4856,6 +4882,7 @@ void MySQL_Thread::process_all_sessions() {
 	}
 	for (n=0; n<mysql_sessions->len; n++) {
 		MySQL_Session *sess=(MySQL_Session *)mysql_sessions->index(n);
+		if (sess->client_myds && sess->client_myds->spill_completed_event()) sess->to_process = 1;
 #ifdef DEBUG
 		if(sess==sess_stopat) {
 			sess_stopat=sess;
@@ -4979,6 +5006,9 @@ void MySQL_Thread::refresh_variables() {
 	REFRESH_VARIABLE_INT(max_transaction_time);
 	REFRESH_VARIABLE_INT(threshold_query_length);
 	REFRESH_VARIABLE_INT(threshold_resultset_size);
+	REFRESH_VARIABLE_BOOL(resultset_spill_enabled);
+	REFRESH_VARIABLE_CHAR(resultset_spill_directory);
+	REFRESH_VARIABLE_INT(resultset_spill_limit);
 	REFRESH_VARIABLE_INT(query_digests_max_digest_length);
 	REFRESH_VARIABLE_INT(query_digests_max_query_length);
 	REFRESH_VARIABLE_INT(wait_timeout);
@@ -5221,6 +5251,7 @@ MySQL_Thread::MySQL_Thread() {
 	mysql_thread___ldap_user_variable=NULL;
 	mysql_thread___add_ldap_user_comment=NULL;
 	mysql_thread___eventslog_filename=NULL;
+	mysql_thread___resultset_spill_directory=NULL;
 	mysql_thread___auditlog_filename=NULL;
 	mysql_thread___resolution_family=strdup("system");  // default: system (AF_UNSPEC)
 

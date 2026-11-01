@@ -422,6 +422,11 @@ MySQL_Data_Stream::~MySQL_Data_Stream() {
 
 	proxy_debug(PROXY_DEBUG_NET,1, "Shutdown Data Stream. Session=%p, DataStream=%p\n" , sess, this);
 	PtrSize_t pkt;
+	// Cancel notification before the owning worker thread can close its pipe.
+	result_spool.reset();
+	while (spill_read_output.len) {
+		spill_read_output.remove_index_fast(0, &pkt); l_free(pkt.size, pkt.ptr);
+	}
 	if (PSarrayIN) {
 		while (PSarrayIN->len) {
 			PSarrayIN->remove_index_fast(0,&pkt);
@@ -608,7 +613,10 @@ void MySQL_Data_Stream::shut_hard() {
  * @see shut_soft()
  */
 void MySQL_Data_Stream::check_data_flow() {
-	if ( (PSarrayIN->len || queue_data(queueIN) ) && ( PSarrayOUT->len || queue_data(queueOUT) ) ){
+	const bool queued_frontend_commands = myds_type == MYDS_FRONTEND && sess &&
+		sess->session_type == PROXYSQL_SESSION_MYSQL && !sess->session_fast_forward && spill_serialize_commands;
+	if (!queued_frontend_commands && (PSarrayIN->len || queue_data(queueIN)) &&
+	    (PSarrayOUT->len || queue_data(queueOUT))) {
 		// NOTE: Unexpected-Ping-Handling: Section 1-2
 		///////////////////////////////////////////////////////////////////////////////////////////////
 		// Implements part-1 of the temporary workaround for the handling of unexpected 'COM_PING' packets
@@ -1045,9 +1053,91 @@ int MySQL_Data_Stream::write_to_net() {
 	return bytes_io;
 }
 
+uint64_t MySQL_Data_Stream::output_memory_bytes() const {
+	uint64_t bytes = result_spool ? result_spool->memory_bytes() : 0;
+	if (PSarrayOUT) for (unsigned int i = 0; i < PSarrayOUT->len; ++i) bytes += PSarrayOUT->index(i)->size;
+	for (unsigned int i = 0; i < spill_read_output.len; ++i) bytes += spill_read_output.pdata[i].size;
+	bytes += queue_data(queueOUT);
+	if (queueOUT.pkt.ptr) bytes += queueOUT.pkt.size;
+	return bytes;
+}
+
+bool MySQL_Data_Stream::spill_pending() const {
+	return result_spool && (result_spool->error() || result_spool->pending() || spill_read_output.len || spill_packet_offset ||
+		!spill_header_carry.empty());
+}
+
+bool MySQL_Data_Stream::spill_wire_ready() const {
+	return spill_read_output.len || queue_data(queueOUT) || queueOUT.partial;
+}
+
+bool MySQL_Data_Stream::spill_completed_event() {
+	return result_spool && result_spool->completed_event();
+}
+
+bool MySQL_Data_Stream::spill_output() {
+	if (result_spool && !result_spool->error() && !result_spool->pending() && !PSarrayOUT->len &&
+	    !spill_read_output.len && !spill_packet_offset && !queueOUT.partial && !queue_data(queueOUT) &&
+	    spill_header_carry.empty()) {
+		result_spool.reset(); result_spill_eligible = false;
+	}
+	if (!result_spool && result_spill_eligible && mysql_thread___resultset_spill_enabled &&
+	    sess && sess->thread && sess->session_type == PROXYSQL_SESSION_MYSQL &&
+	    !sess->mirror && !sess->session_fast_forward && myds_type == MYDS_FRONTEND && output_memory_bytes() >
+	    static_cast<uint64_t>(mysql_thread___threshold_resultset_size)) {
+		result_spool.reset(new MySQL_ResultSpool(mysql_thread___resultset_spill_directory,
+			mysql_thread___threshold_resultset_size, mysql_thread___resultset_spill_limit,
+			sess->thread->pipefd[1]));
+		spill_framer.reset();
+		spill_header_carry.clear();
+	}
+	if (!result_spool) return true;
+	// Bound a single event worker's handoff work even for an oversized row.
+	size_t budget = mysql_thread___threshold_resultset_size;
+	while (PSarrayOUT->len && budget) {
+		PtrSize_t* packet = PSarrayOUT->index(0);
+		size_t n = result_spool->append(static_cast<unsigned char*>(packet->ptr) + spill_packet_offset,
+			std::min<size_t>(packet->size - spill_packet_offset, budget));
+		if (!n) break;
+		spill_packet_offset += n; budget -= n;
+		if (spill_packet_offset == packet->size) {
+			PtrSize_t done; PSarrayOUT->remove_index(0, &done);
+			l_free(done.size, done.ptr); spill_packet_offset = 0;
+		}
+	}
+	if (!spill_read_output.len) {
+		auto data = result_spool->take();
+		if (!data.empty() && myconn && myconn->get_status(STATUS_MYSQL_CONNECTION_COMPRESSION)) {
+			// The block has any size, and generate_compressed_packet() makes one compressed packet of it.
+			// We keep a cut inside a packet header away from the client.
+			if (!spill_header_carry.empty()) {
+				data.insert(data.begin(), spill_header_carry.begin(), spill_header_carry.end());
+				spill_header_carry.clear();
+			}
+			const size_t held = spill_framer.feed(data.data(), data.size());
+			if (held) {
+				spill_header_carry.assign(data.end() - held, data.end());
+				data.resize(data.size() - held);
+			}
+		}
+		if (!data.empty()) {
+			void* ptr = l_alloc(data.size()); memcpy(ptr, data.data(), data.size());
+			spill_read_output.add(ptr, data.size());
+		}
+	}
+	if (result_spool->error()) {
+		proxy_error("MySQL result spill failed for session %p: %s; closing response stream\n",
+			sess, strerror(result_spool->error()));
+		set_net_failure();
+		if (sess) sess->set_unhealthy();
+		return false;
+	}
+	return true;
+}
+
 bool MySQL_Data_Stream::available_data_out() {
 	int buflen=queue_data(queueOUT);
-	if (buflen || PSarrayOUT->len) {
+	if (buflen || PSarrayOUT->len || queueOUT.partial || spill_pending()) {
 		return true;
 	}
 	return false;
@@ -1083,7 +1173,9 @@ void MySQL_Data_Stream::set_pollout() {
 			}
 		}
 		//if (PSarrayOUT->len || available_data_out() || queueOUT.partial || (encrypted && !SSL_is_init_finished(ssl))) {
-		if (PSarrayOUT->len || available_data_out() || queueOUT.partial) {
+		if ((result_spool ? spill_wire_ready() : (PSarrayOUT->len || available_data_out())) || queueOUT.partial ||
+		    (spill_serialize_commands && PSarrayIN && PSarrayIN->len && sess &&
+		     sess->status == WAITING_CLIENT_DATA && !available_data_out())) {
 			_pollfd->events |= POLLOUT;
 		}
 		if (encrypted) {
@@ -1280,7 +1372,9 @@ int MySQL_Data_Stream::buffer2array() {
 			proxy_debug(PROXY_DEBUG_PKT_ARRAY, 5, "Session=%p . Reading the header of a new compressed packet\n", sess);
  			memcpy(&queueIN.hdr,queue_r_ptr(queueIN), sizeof(mysql_hdr));
 			queue_r(queueIN,sizeof(mysql_hdr));
-			pkt_sid=queueIN.hdr.pkt_id;
+			// The response owns pkt_sid until queued command dispatch restores
+			// its request header. A pipelined input must not reset multi-result IDs.
+			if (!spill_serialize_commands) pkt_sid = queueIN.hdr.pkt_id;
 			queueIN.pkt.size=queueIN.hdr.pkt_length+sizeof(mysql_hdr)+3;
 			queueIN.pkt.ptr=l_alloc(queueIN.pkt.size);
 			memcpy(queueIN.pkt.ptr, &queueIN.hdr, sizeof(mysql_hdr)); // immediately copy the header into the packet
@@ -1289,7 +1383,13 @@ int MySQL_Data_Stream::buffer2array() {
 			queueIN.partial=7;
 			mysql_hdr *_hdr;
 			_hdr=(mysql_hdr *)queueIN.pkt.ptr;
-			myconn->compression_pkt_id=_hdr->pkt_id;
+			if (myds_type == MYDS_FRONTEND && sess && sess->session_type == PROXYSQL_SESSION_MYSQL &&
+			    !sess->session_fast_forward && (mysql_thread___resultset_spill_enabled || spill_serialize_commands)) {
+				spill_serialize_commands = true;
+				spill_received_compression_id = _hdr->pkt_id;
+			} else {
+				myconn->compression_pkt_id = _hdr->pkt_id;
+			}
 			ret+=7;
 		}
 	} else {
@@ -1403,7 +1503,9 @@ int MySQL_Data_Stream::buffer2array() {
 			}
 			proxy_debug(PROXY_DEBUG_PKT_ARRAY, 5, "Session=%p . Reading the header of a new packet\n", sess);
 			memcpy(&queueIN.hdr,queue_r_ptr(queueIN),sizeof(mysql_hdr));
-			pkt_sid=queueIN.hdr.pkt_id;
+			// The response owns pkt_sid until queued command dispatch restores
+			// its request header. A pipelined input must not reset multi-result IDs.
+			if (!spill_serialize_commands) pkt_sid = queueIN.hdr.pkt_id;
 			queue_r(queueIN,sizeof(mysql_hdr));
 			queueIN.pkt.size=queueIN.hdr.pkt_length+sizeof(mysql_hdr);
 			queueIN.pkt.ptr=l_alloc(queueIN.pkt.size);
@@ -1475,6 +1577,7 @@ int MySQL_Data_Stream::buffer2array() {
 						CompPktIN.partial=0; // stays 0
 						progress+=CompPktIN.pkt.size;
 						PSarrayIN->add(CompPktIN.pkt.ptr, CompPktIN.pkt.size);
+						if (spill_serialize_commands) spill_input_compression_ids.push_back(spill_received_compression_id);
 						CompPktIN.pkt.ptr=NULL; // sanity
 					} else {
 						// not enough data for the whole packet
@@ -1491,6 +1594,7 @@ int MySQL_Data_Stream::buffer2array() {
 						// split packets, we could jump over the remaining unprocessed data.
 						progress+= CompPktIN.pkt.size - CompPktIN.partial;
 						PSarrayIN->add(CompPktIN.pkt.ptr, CompPktIN.pkt.size);
+						if (spill_serialize_commands) spill_input_compression_ids.push_back(spill_received_compression_id);
 						// Reset partial after full packet datalength has been processed
 						CompPktIN.partial=0;
 						CompPktIN.pkt.ptr=NULL; // sanity
@@ -1614,6 +1718,9 @@ void MySQL_Data_Stream::generate_compressed_packet() {
 
 
 int MySQL_Data_Stream::array2buffer() {
+	if (!spill_output()) return 0;
+	PtrSizeArray* producer_output = nullptr;
+	if (result_spool) { producer_output = PSarrayOUT; PSarrayOUT = &spill_read_output; }
 	int ret=0;
 	unsigned int idx=0;
 	bool cont=true;
@@ -1701,6 +1808,8 @@ __exit_array2buffer:
 	if (idx) {
 		PSarrayOUT->remove_index_range(0,idx);
 	}
+	if (producer_output) PSarrayOUT = producer_output;
+	if (!result_spool && !PSarrayOUT->len) result_spill_eligible = false;
 	return ret;
 }
 
