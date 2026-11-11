@@ -94,14 +94,16 @@ namespace {
 struct StarRocksKillTarget {
 	unsigned long fe_connection_id;
 	std::string fe_address;
+	std::string username;
 };
 std::mutex starrocks_kill_mutex;
 std::unordered_map<uint32_t, StarRocksKillTarget> starrocks_kill_targets;
 }
 
-static void starrocks_kill_register(uint32_t id, unsigned long fe_connection_id, const std::string& fe_address) {
+static void starrocks_kill_register(uint32_t id, unsigned long fe_connection_id, const std::string& fe_address,
+	const std::string& username) {
 	std::lock_guard<std::mutex> lock(starrocks_kill_mutex);
-	starrocks_kill_targets[id] = StarRocksKillTarget { fe_connection_id, fe_address };
+	starrocks_kill_targets[id] = StarRocksKillTarget { fe_connection_id, fe_address, username };
 }
 
 static void starrocks_kill_unregister(uint32_t id) {
@@ -2328,7 +2330,9 @@ int MySQL_Session::handler_again___status_RESETTING_CONNECTION() {
  */
 void MySQL_Session::handler_again___new_thread_to_kill_connection() {
 	MySQL_Data_Stream *myds=mybe->server_myds;
-	if (myds->myconn && myds->myconn->mysql) {
+	// The kill thread logs in with the password of the user. A StarRocks relay connection has none, so for it the
+	// FE cancels the query when the session closes its connection.
+	if (myds->myconn && myds->myconn->mysql && !myds->myconn->starrocks_relay) {
 		if (myds->killed_at==0) {
 			myds->wait_until=0;
 			myds->killed_at=thread->curtime;
@@ -10536,7 +10540,7 @@ void MySQL_Session::starrocks_login_complete(bool& wrong_pass) {
 	default_schema = strdup(client_myds->myconn->userinfo->schemaname);
 	client_authenticated = true;
 	starrocks_kill_register(thread_session_id, mysql_thread_id(mc->mysql),
-		std::string(mc->parent->address) + ":" + std::to_string(mc->parent->port));
+		std::string(mc->parent->address) + ":" + std::to_string(mc->parent->port), starrocks_login_user);
 	starrocks_kill_registered = true;
 	__sync_fetch_and_add(&MyHGM->status.client_connections_prim_pass, 1);
 	if (GloMyLogger) {
@@ -10691,15 +10695,29 @@ bool MySQL_Session::starrocks_rewrite_kill(PtrSize_t *pkt, bool query_only, unsi
 	if (own == NULL || !starrocks_kill_lookup(id, target)) return false;
 	const std::string own_address = std::string(own->parent->address) + ":" + std::to_string(own->parent->port);
 	if (target.fe_address != own_address) {
-		// KILL by connection id is local to one FE: another FE would answer that the id does not exist.
-		// We cannot log in to the other FE for this client, so we say what is wrong.
-		std::string message;
-		string_format("ProxySQL: connection %d is on the StarRocks FE %s, and this connection is on %s. "
-			"The FE kills only its own connections", message, id, target.fe_address.c_str(), own_address.c_str());
+		// KILL by connection id is local to one FE, and this connection is on another FE than the target session,
+		// for example because the FE of the target is drained and new logins go to another FE. ProxySQL holds the
+		// target session, so it ends that session itself: its FE connection closes, and the FE cancels the query
+		// of that connection. KILL QUERY ends the session too, because ProxySQL has no other way to stop the query.
+		// ProxySQL cannot check the privilege of the FE to kill the session of another user, so it refuses that.
 		client_myds->setDSS_STATE_QUERY_SENT_NET();
-		client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, 1, 1094, (char *)"HY000", message.c_str(), true);
-		client_myds->DSS = STATE_SLEEP;
-		RequestEnd(NULL, 1094, message.c_str());
+		const char *username = client_myds->myconn->userinfo->username;
+		if (target.username != username) {
+			std::string message;
+			string_format("ProxySQL: connection %d belongs to another user and is on the StarRocks FE %s, and this "
+				"connection is on %s. Kill it through a connection on that FE", message, id, target.fe_address.c_str(),
+				own_address.c_str());
+			client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, 1, 1095, (char *)"HY000", message.c_str(), true);
+			client_myds->DSS = STATE_SLEEP;
+			RequestEnd(NULL, 1095, message.c_str());
+		} else {
+			proxy_info("Ending session %u on the StarRocks FE %s for %s %u from a session on %s\n", id,
+				target.fe_address.c_str(), query_only ? "KILL QUERY" : "KILL", id, own_address.c_str());
+			GloMTH->kill_connection_or_query(id, false, const_cast<char *>(username));
+			client_myds->myprot.generate_pkt_OK(true, NULL, NULL, 1, 0, 0, autocommit ? SERVER_STATUS_AUTOCOMMIT : 0, 0, NULL);
+			client_myds->DSS = STATE_SLEEP;
+			RequestEnd(NULL);
+		}
 		l_free(pkt->size, pkt->ptr);
 		return true;
 	}

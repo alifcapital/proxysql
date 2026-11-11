@@ -125,7 +125,12 @@ the FE answers with its own OK or error. The FE lets a user kill its own session
 and requires `OPERATE` for the sessions of other users. The connection id is kept
 by one ProxySQL, so the `KILL` must reach the ProxySQL that holds the session.
 The FE kills only its own connections. If the new connection is on another FE than
-the session it wants to kill, the client gets the error 1094 that names both FEs.
+the session it wants to kill (for example, while the FE of that session is drained),
+ProxySQL ends that session itself when it belongs to the same user: it closes the
+client connection and the FE connection of that session, and the FE cancels the
+query. `KILL QUERY` then ends the whole session, because ProxySQL has no other way to
+stop the query on that FE. ProxySQL cannot check the privilege of the FE to kill the
+session of another user on another FE, so that `KILL` gets the error 1095.
 `KILL QUERY 'query_id'` with a query id string goes to the FE as it is, and the FE
 forwards it to the FE that owns the query.
 
@@ -164,8 +169,8 @@ session. So the old FE keeps its sessions, and only new logins go to the new FE.
    stopping the FE earlier cuts them.
 
 While a session is on the old FE, a `KILL` that its client sends over a new connection
-lands on the new FE and gets the error 1094, because an FE kills only its own
-connections. A query of such a session still stops when its client disconnects.
+lands on the new FE. ProxySQL then ends that session itself (see `KILL` above), so
+Ctrl+C stops the query, and the session ends with it.
 
 ProxySQL closes the client connection when the FE connection of the client ends (the
 FE stops or restarts, or the connection is killed on the FE), or when the FE is set to

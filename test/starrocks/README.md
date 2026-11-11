@@ -70,7 +70,8 @@ Implemented acceptance fixtures (execution results must be recorded separately):
   statements; after an FE switch a running query finishes, the running and the idle
   session stay on the old FE with their FE connections, a new client lands on the
   `ONLINE` FE, and the old FE is free when its clients leave; an open transaction
-  goes on and commits on the old FE. Each case starts with only `backend` in the
+  goes on and commits on the old FE; Ctrl+C of a session on the old FE, sent over a new
+  connection on the new FE, stops its query. Each case starts with only `backend` in the
   hostgroup; `new_fe` is the second FE that each case adds when it switches.
 * `protocol_edges.py`: compressed raw pipelining and COM_QUIT with unread spill.
 * `large_packets.py`: large wire packets across the protocol packet boundary,

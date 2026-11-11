@@ -16,11 +16,14 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import socket
+import threading
 import traceback
 
 from e2e import connect, sql, eventually
 
 DATABASE = "sticky_switch_test"
+# Runs on the compute nodes until it is stopped.
+HEAVY_QUERY = "SELECT count(*) FROM TABLE(generate_series(1,100000000000)) t WHERE generate_series % 7 = 3"
 
 
 def physical_id(connection):
@@ -168,13 +171,52 @@ class Suite:
                 client.close()
             sql(self.oracle, "DROP DATABASE IF EXISTS %s FORCE" % DATABASE)
 
+    def kill_on_the_old_fe(self):
+        """After a switch, Ctrl+C of a session that stays on the old FE stops its query."""
+        old = (self.config["backend"]["host"], self.config["backend"]["port"])
+        new = (self.config["new_fe"]["host"], self.config["new_fe"]["port"])
+        victim = connect(self.config["proxy"])
+        killer = None
+        outcome = {}
+
+        def run():
+            try:
+                outcome["rows"] = sql(victim, HEAVY_QUERY)
+            except Exception as error:
+                outcome["error"] = error
+
+        thread = threading.Thread(target=run, daemon=True)
+        try:
+            thread.start()
+            eventually(lambda: any(row[5] == b"Query" and b"generate_series(1,100000000000)" in (row[9] or b"")
+                                   for row in sql(self.oracle, "SHOW PROCESSLIST")), 10)
+            switch_to_new_fe(self.admin, self.config)
+            # The mysql client and Connector/J cancel over a new connection, which lands on the ONLINE FE.
+            killer = connect(self.config["proxy"])
+            assert pool_used(self.admin, self.config, *new) == 1
+            assert not sql(killer, "KILL QUERY %d" % victim.thread_id()), "the KILL answered with rows"
+            thread.join(30)
+            assert not thread.is_alive(), "the query on the old FE was not stopped"
+            assert "error" in outcome, outcome
+            eventually(lambda: not any(b"generate_series(1,100000000000)" in (row[9] or b"")
+                                       for row in sql(self.oracle, "SHOW PROCESSLIST")), 10)
+            eventually(lambda: pool_used(self.admin, self.config, *old) == 0, 10)
+        finally:
+            for connection in (killer, victim):
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
+
     def run(self):
         original = saved_servers(self.admin, self.config)
         try:
             cases = (("client keeps its FE connection between statements", self.connection_stays),
                      ("after a switch the running query finishes, both sessions stay on the old FE, and a new client lands on the ONLINE FE",
                       self.switch_keeps_sessions_on_the_old_fe),
-                     ("an open transaction finishes and commits on the old FE after a switch", self.transaction_finishes_on_the_old_fe))
+                     ("an open transaction finishes and commits on the old FE after a switch", self.transaction_finishes_on_the_old_fe),
+                     ("after a switch, Ctrl+C of a session on the old FE stops its query", self.kill_on_the_old_fe))
             for name, function in cases:
                 only_backend(self.admin, self.config)
                 self.case(name, function)

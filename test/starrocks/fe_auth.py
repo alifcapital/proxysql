@@ -694,45 +694,56 @@ class Suite:
             connection.close()
             direct.close()
 
+    def fe_of(self, connection):
+        """Host and port of the FE that ProxySQL connected for this client."""
+        rows = sql(self.admin, "SELECT srv_host, srv_port FROM stats_mysql_processlist WHERE SessionID=%s",
+                   (connection.thread_id(),))
+        return tuple(rows[0]) if rows else None
+
+    def login_on_other_fe(self, user, password, fe):
+        """A client of the user whose FE connection is not on the FE given."""
+        for _ in range(40):
+            connection = login(self.config, user, password)
+            if self.fe_of(connection) != fe:
+                return connection
+            connection.close()
+        raise AssertionError("no login landed on the other FE")
+
     def kill_across_two_fes(self):
-        """KILL by connection id is local to an FE. With sessions on two servers, the client learns it."""
+        """KILL by connection id is local to an FE. ProxySQL ends a session of the same user on another FE itself."""
         rows = sql(self.admin, "SELECT hostname,port,weight FROM mysql_servers WHERE hostgroup_id=%s", (self.config["hostgroup"],))
         assert len(rows) == 2, "the hostgroup needs two servers (setup.py adds the second one)"
         sql(self.admin, "UPDATE mysql_servers SET weight=1000000 WHERE hostgroup_id=%s", (self.config["hostgroup"],))
         sql(self.admin, "LOAD MYSQL SERVERS TO RUNTIME")
-        killed, refused = 0, []
+        victim, fe_id, outcome = self.start_heavy_query()
+        killer = other = None
         try:
-            for _ in range(40):
-                if killed and refused:
-                    break
-                victim, fe_id, outcome = self.start_heavy_query()
-                try:
-                    killer = login(self.config, PASSWORD_USER, PASSWORD)
-                    try:
-                        try:
-                            sql(killer, "KILL QUERY %d" % victim.thread_id())
-                        except pymysql.err.Error as error:
-                            refused.append(error.args)
-                            continue
-                    finally:
-                        killer.close()
-                    killed += 1
-                    eventually(lambda: fe_id not in heavy_queries(self.oracle), 10)
-                finally:
-                    # The owner stops its own query (it is on the FE of the victim).
-                    try:
-                        sql(self.oracle, "KILL QUERY %d" % fe_id)
-                    except pymysql.err.Error:
-                        pass
-                    victim.close()
+            victim_fe = self.fe_of(victim)
+            other = self.login_on_other_fe(EMPTY_USER, "", victim_fe)
+            killer = self.login_on_other_fe(PASSWORD_USER, PASSWORD, victim_fe)
+            # ProxySQL cannot check the privilege of the FE to kill the session of another user.
+            refused = self.command_error(lambda: sql(other, "KILL QUERY %d" % victim.thread_id()))
+            assert refused[0] == 1095 and "ProxySQL: connection" in refused[1], refused
+            assert fe_id in heavy_queries(self.oracle), "the query of the victim stopped after a refused KILL"
+            # The same user stops its query from the other FE: ProxySQL ends the session of the victim.
+            assert not sql(killer, "KILL QUERY %d" % victim.thread_id()), "the KILL answered with rows"
+            outcome["thread"].join(30)
+            assert not outcome["thread"].is_alive(), "the query was not interrupted"
+            assert "error" in outcome, outcome
+            eventually(lambda: fe_id not in heavy_queries(self.oracle), 10)
+            eventually(lambda: fe_id not in cn_queries(self.oracle), 10)
+            assert sql(killer, "SELECT 1") == ((1,),), "the session of the killer goes on"
         finally:
+            for connection in (killer, other, victim):
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
             for host, port, weight in rows:
                 sql(self.admin, "UPDATE mysql_servers SET weight=%s WHERE hostgroup_id=%s AND hostname=%s AND port=%s",
                     (int(weight), self.config["hostgroup"], host.decode() if isinstance(host, bytes) else host, int(port)))
             sql(self.admin, "LOAD MYSQL SERVERS TO RUNTIME")
-        assert killed, "no KILL ran on the FE of the victim"
-        assert refused, "no pair of sessions was on different servers"
-        assert all(args[0] == 1094 and "ProxySQL: connection" in args[1] for args in refused), refused
 
     def jdbc_cancel_and_timeout(self):
         if not self.jar:
@@ -853,7 +864,7 @@ class Suite:
                 ("KILL id from a second connection ends the first connection", self.kill_connection_from_second_connection),
                 ("KILL of a session of another user gets the error of the FE", self.kill_of_another_user_gets_the_fe_error),
                 ("KILL of an unknown id gets the error of the FE", self.kill_of_unknown_id),
-                ("KILL of a session on another FE gets a clear error", self.kill_across_two_fes),
+                ("KILL of a session on another FE ends it for the same user and is refused for another user", self.kill_across_two_fes),
                 ("Connector/J Statement.cancel() and setQueryTimeout() stop the query", self.jdbc_cancel_and_timeout),
                 ("a client socket closed in the middle of a query stops the query on the FE", self.client_socket_closed_mid_query),
                 ("clients that leave in the middle of queries leave no running query", self.client_killed_mid_query_stops_cn_work),
