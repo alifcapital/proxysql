@@ -266,7 +266,11 @@ class MySQL_STMT_Manager_v14 {
 	void unlock() { pthread_rwlock_unlock(&rwlock_); }
 	void ref_count_client(uint64_t _stmt, int _v, bool lock=true);
 	void ref_count_server(uint64_t _stmt, int _v, bool lock=true);
-	MySQL_STMT_Global_info * add_prepared_statement(char *u, char *s, char *q, unsigned int ql, char *fc, MYSQL_STMT *stmt, bool lock=true);
+	/**
+	 * @param salt When not 0, it is mixed into the hash, so the statement does not match the same text that
+	 *  another session or another prepare of the same session prepared.
+	 */
+	MySQL_STMT_Global_info * add_prepared_statement(char *u, char *s, char *q, unsigned int ql, char *fc, MYSQL_STMT *stmt, bool lock=true, uint64_t salt=0);
 	void get_metrics(uint64_t *c_unique, uint64_t *c_total, uint64_t *stmt_max_stmt_id, uint64_t *cached, uint64_t *s_unique, uint64_t *s_total);
 	SQLite3_result * get_prepared_statements_global_infos();
 	void get_memory_usage(uint64_t& prep_stmt_metadata_mem_usage, uint64_t& prep_stmt_backend_mem_usage);

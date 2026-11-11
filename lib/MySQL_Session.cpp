@@ -754,6 +754,9 @@ MySQL_Session::MySQL_Session() {
 	passthrough_connect_failed = false;
 	passthrough_connect_fail_reason = NULL;
 	starrocks_auth_session = false;
+	starrocks_client_init_db = false;
+	starrocks_client_ping = false;
+	starrocks_prepare_count = 0;
 	starrocks_login_phase = STARROCKS_LOGIN_NONE;
 	starrocks_login_retries = 0;
 	starrocks_login_has_db = false;
@@ -1259,6 +1262,17 @@ void MySQL_Session::generate_proxysql_internal_session_json(json &j) {
 bool MySQL_Session::handler_special_queries(PtrSize_t *pkt) {
 	bool deprecate_eof_active = client_myds->myconn->options.client_flag & CLIENT_DEPRECATE_EOF;
 
+	if (starrocks_auth_session) {
+		// The FE answers the queries of this client, see starrocks_auth_session. We keep only what is about
+		// ProxySQL itself: its own PROXYSQL INTERNAL commands, the TLS version of the connection between the
+		// client and ProxySQL, and the refusal of LOAD DATA LOCAL INFILE, which would read a file of this host.
+		if (pkt->size>(5+18) && strncasecmp((char *)"PROXYSQL INTERNAL ",(char *)pkt->ptr+5,18)==0) {
+			return_proxysql_internal(pkt);
+			return true;
+		}
+		goto __proxysql_own_queries;
+	}
+
 	if (
 		(pkt->size == (SELECT_DB_USER_LEN+5))
 		||
@@ -1528,6 +1542,7 @@ bool MySQL_Session::handler_special_queries(PtrSize_t *pkt) {
 		return true;
 	}
 
+__proxysql_own_queries:
 	// Handle SHOW STATUS LIKE 'Ssl_version%'
 	if ((pkt->size >= SHOW_STATUS_LIKE_SSL_VERSION_LEN + 5) && (strncasecmp(SHOW_STATUS_LIKE_SSL_VERSION, (char*)pkt->ptr + 5, SHOW_STATUS_LIKE_SSL_VERSION_LEN) == 0)) {
 		SQLite3_result* resultset = new SQLite3_result(2);
@@ -1705,6 +1720,9 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
  * @see ProxySQL_MySQL_Error_Counter::p_update_mysql_error_counter()
  */
 int MySQL_Session::handler_again___status_PINGING_SERVER() {
+	if (starrocks_client_ping) {
+		return handler_again___status_PINGING_SERVER_for_client();
+	}
 	assert(mybe->server_myds->myconn);
 	MySQL_Data_Stream *myds=mybe->server_myds;
 	MySQL_Connection *myconn=myds->myconn;
@@ -2853,15 +2871,6 @@ bool MySQL_Session::handler_again___verify_backend_autocommit() {
 
 bool MySQL_Session::handler_again___verify_backend_user_schema() {
 	MySQL_Data_Stream *myds=mybe->server_myds;
-	if (starrocks_auth_session) {
-		// We have no password to log in again, so the connection keeps the user that the FE authenticated.
-		// Only the database can change.
-		if (strcmp(client_myds->myconn->userinfo->schemaname, myds->myconn->userinfo->schemaname)) {
-			set_previous_status_mode3();
-			NEXT_IMMEDIATE_NEW(CHANGING_SCHEMA);
-		}
-		return false;
-	}
 	proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Session %p , client: %s , backend: %s\n", this, client_myds->myconn->userinfo->username, mybe->server_myds->myconn->userinfo->username);
 	proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Session %p , client: %s , backend: %s\n", this, client_myds->myconn->userinfo->schemaname, mybe->server_myds->myconn->userinfo->schemaname);
 	if (client_myds->myconn->userinfo->hash!=mybe->server_myds->myconn->userinfo->hash) {
@@ -3523,6 +3532,12 @@ bool MySQL_Session::handler_again___status_CHANGING_SCHEMA(int *_rc) {
 		__sync_fetch_and_add(&MyHGM->status.backend_init_db, 1);
 		myds->myconn->userinfo->set(client_myds->myconn->userinfo);
 		myds->DSS = STATE_MARIADB_GENERIC;
+		if (starrocks_client_init_db) {
+			starrocks_client_init_db = false;
+			GloMyLogger->log_audit_entry(PROXYSQL_MYSQL_INITDB, this, NULL);
+			starrocks_reply_ok_of_fe(myds);
+			return false;
+		}
 		st=previous_status.top();
 		previous_status.pop();
 		NEXT_IMMEDIATE_NEW(st);
@@ -3537,6 +3552,23 @@ bool MySQL_Session::handler_again___status_CHANGING_SCHEMA(int *_rc) {
 				myconn->parent->port,
 				( myerr ? myerr : ER_PROXYSQL_OFFLINE_SRV )
 			);
+			if (starrocks_client_init_db && myconn->async_state_machine == ASYNC_INITDB_FAILED &&
+				myerr != 0 && (myerr < 2000 || myerr >= 3000)) {
+				// The FE refused the database of the client, for example an unknown catalog (StarRocks codes start at
+				// 5000, the client library uses 2000-2999). The connection is fine, so the client gets the error of the
+				// FE and keeps its connection, which stays in the catalog and the database that it had.
+				starrocks_client_init_db = false;
+				myconn->async_state_machine = ASYNC_IDLE;
+				myds->DSS = STATE_MARIADB_GENERIC;
+				char *fe_schema = myconn->userinfo->schemaname ? myconn->userinfo->schemaname : (char *)"";
+				client_myds->myconn->userinfo->set_schemaname(fe_schema, strlen(fe_schema));
+				char sqlstate[10];
+				snprintf(sqlstate, sizeof(sqlstate), "%s", mysql_sqlstate(myconn->mysql));
+				client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,myerr,sqlstate,mysql_error(myconn->mysql));
+				client_myds->DSS = STATE_SLEEP;
+				status = WAITING_CLIENT_DATA;
+				return false;
+			}
 			if (myerr >= 2000 || myerr == 0) {
 				bool retry_conn=false;
 				// client error, serious
@@ -4241,7 +4273,9 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 		MySQL_STMT_Global_info *stmt_info=NULL;
 		// we first lock GloStmt
 		GloMyStmt->wrlock();
-		stmt_info=GloMyStmt->find_prepared_statement_by_hash(hash);
+		// The FE prepares each statement of a client whom it authenticated, in the catalog and the database that the
+		// FE has for that client, see starrocks_auth_session. A statement prepared before could see other tables.
+		stmt_info = starrocks_auth_session ? NULL : GloMyStmt->find_prepared_statement_by_hash(hash);
 		if (stmt_info) {
 			// the prepared statement exists in GloMyStmt
 			// for this reason, we do not need to prepare it again, and we can already reply to the client
@@ -5073,7 +5107,8 @@ bool MySQL_Session::GPFC_QueryUSE(PtrSize_t& pkt, int& handler_ret) {
 	// This block was moved from 'handler_special_queries' to support
 	// handling of 'USE' statements which are preceded by a comment.
 	// For more context check issue: #3493.
-	if (session_type != PROXYSQL_SESSION_CLICKHOUSE) {
+	// The FE that authenticated the client runs USE itself and answers it, see starrocks_auth_session.
+	if (session_type != PROXYSQL_SESSION_CLICKHOUSE && !starrocks_auth_session) {
 		const char *qd = CurrentQuery.get_digest_text();
 		bool use_db_query = false;
 
@@ -5628,14 +5663,26 @@ bool MySQL_Session::handler_rc0_PROCESSING_STMT_PREPARE(enum session_status& st,
 	uint64_t global_stmtid;
 	//bool is_new;
 	MySQL_STMT_Global_info *stmt_info=NULL;
-	stmt_info=GloMyStmt->add_prepared_statement(
-		(char *)client_myds->myconn->userinfo->username,
-		(char *)client_myds->myconn->userinfo->schemaname,
-		(char *)CurrentQuery.QueryPointer,
-		CurrentQuery.QueryLength,
-		CurrentQuery.QueryParserArgs.first_comment,
-		CurrentQuery.mysql_stmt,
-		false);
+	if (starrocks_auth_session && previous_status.size()) {
+		// An EXECUTE prepared again the statement of the client on the FE connection, so it stays that statement.
+		stmt_info=GloMyStmt->find_prepared_statement_by_stmt_id(CurrentQuery.stmt_global_id, false);
+		stmt_info->update_metadata(CurrentQuery.mysql_stmt);
+		GloMyStmt->ref_count_server(stmt_info->statement_id, 1, false);
+	} else {
+		// ProxySQL does not know the catalog and the database in which the FE prepared the statement of a client
+		// whom the FE authenticated, so each such prepare gets a statement of its own, see starrocks_auth_session.
+		const uint64_t salt = starrocks_auth_session
+			? ((uint64_t)thread_session_id << 32) | ++starrocks_prepare_count : 0;
+		stmt_info=GloMyStmt->add_prepared_statement(
+			(char *)client_myds->myconn->userinfo->username,
+			(char *)client_myds->myconn->userinfo->schemaname,
+			(char *)CurrentQuery.QueryPointer,
+			CurrentQuery.QueryLength,
+			CurrentQuery.QueryParserArgs.first_comment,
+			CurrentQuery.mysql_stmt,
+			false,
+			salt);
+	}
 	if (CurrentQuery.QueryParserArgs.digest_text) {
 		if (stmt_info->digest_text==NULL) {
 			stmt_info->digest_text=strdup(CurrentQuery.QueryParserArgs.digest_text);
@@ -6297,12 +6344,15 @@ handler_again:
 					thread->mypolls.add(POLLIN|POLLOUT, mybe->server_myds->fd, mybe->server_myds, thread->curtime);
 				}
 				if (default_hostgroup>=0) {
-					if (handler_again___verify_backend_user_schema()) {
+					// The FE connection of a client whom the FE authenticated already has the state that the client
+					// set on it, so we send nothing of our own before the request, see starrocks_auth_session.
+					if (!starrocks_auth_session && handler_again___verify_backend_user_schema()) {
 						goto handler_again;
 					}
 					if (mirror==false) { // do not care about autocommit and charset if mirror
 							proxy_debug(PROXY_DEBUG_MYSQL_CONNECTION, 5, "Session %p , default_HG=%d server_myds DSS=%d , locked_on_HG=%d\n", this, default_hostgroup, mybe->server_myds->DSS, locked_on_hostgroup);
-						if (mybe->server_myds->DSS == STATE_READY || mybe->server_myds->DSS == STATE_MARIADB_GENERIC) {
+						if (!starrocks_auth_session &&
+							(mybe->server_myds->DSS == STATE_READY || mybe->server_myds->DSS == STATE_MARIADB_GENERIC)) {
 							if (handler_again___verify_init_connect()) {
 								goto handler_again;
 							}
@@ -7261,6 +7311,14 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 	thread->status_variables.stvar[st_var_frontend_ping]++;
 	l_free(pkt->size,pkt->ptr);
 	client_myds->setDSS_STATE_QUERY_SENT_NET();
+	if (starrocks_auth_session) {
+		// The client pings to know that its FE answers, so the FE answers the ping, see starrocks_auth_session.
+		if (starrocks_forward_to_fe(PINGING_SERVER)) {
+			starrocks_client_ping = true;
+			mybe->server_myds->wait_until = thread->curtime + mysql_thread___ping_timeout_server * 1000;
+		}
+		return;
+	}
 	unsigned int nTrx=NumActiveTransactions();
 	uint16_t setStatus = (nTrx ? SERVER_STATUS_IN_TRANS : 0 );
 	if (autocommit) setStatus |= SERVER_STATUS_AUTOCOMMIT;
@@ -7308,6 +7366,18 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_INIT_DB(PtrSize_t *pkt) {
 	gtid_hid=-1;
 	proxy_debug(PROXY_DEBUG_MYSQL_COM, 5, "Got COM_INIT_DB packet\n");
+	if (session_type == PROXYSQL_SESSION_MYSQL && starrocks_auth_session) {
+		// The FE changes the catalog and the database and answers, see starrocks_auth_session.
+		// CHANGING_SCHEMA sends the schema name of the client connection, so we put the name there.
+		__sync_fetch_and_add(&MyHGM->status.frontend_init_db, 1);
+		client_myds->myconn->userinfo->set_schemaname((char *)pkt->ptr+sizeof(mysql_hdr)+1,pkt->size-sizeof(mysql_hdr)-1);
+		l_free(pkt->size,pkt->ptr);
+		client_myds->setDSS_STATE_QUERY_SENT_NET();
+		if (starrocks_forward_to_fe(CHANGING_SCHEMA)) {
+			starrocks_client_init_db = true;
+		}
+		return;
+	}
 	if (session_type == PROXYSQL_SESSION_MYSQL) {
 		__sync_fetch_and_add(&MyHGM->status.frontend_init_db, 1);
 		client_myds->myconn->userinfo->set_schemaname((char *)pkt->ptr+sizeof(mysql_hdr)+1,pkt->size-sizeof(mysql_hdr)-1);
@@ -7530,6 +7600,12 @@ bool MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 	}
 
 	if (prepare_stmt_type & ps_type_execute_stmt) {	// for prepared statement execute we exit here
+		reset_warning_hostgroup_flag_and_release_connection();
+		goto __exit_set_destination_hostgroup;
+	}
+
+	if (starrocks_auth_session) {
+		// The FE runs SET and SHOW WARNINGS of this client and keeps their state, see starrocks_auth_session.
 		reset_warning_hostgroup_flag_and_release_connection();
 		goto __exit_set_destination_hostgroup;
 	}
@@ -9952,6 +10028,9 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 		sess_STMTs_meta->erase(stmt_global_id);
 	}
 	client_myds->myconn->local_stmts->client_close(client_global_id);
+	if (starrocks_auth_session && stmt_global_id) {
+		starrocks_close_backend_stmt(stmt_global_id);
+	}
 	l_free(pkt.size,pkt.ptr);
 	// FIXME: this is not complete. Counters should be decreased
 	thread->status_variables.stvar[st_var_frontend_stmt_close]++;
@@ -10229,6 +10308,77 @@ MySQL_Connection *MySQL_Session::starrocks_relay_connection() {
 		}
 	}
 	return NULL;
+}
+
+bool MySQL_Session::starrocks_forward_to_fe(enum session_status st) {
+	MySQL_Connection *conn = starrocks_relay_connection();
+	if (conn == NULL) {
+		// starrocks_session_must_end() ends the session when the client has read this error.
+		client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,1927,(char *)"70100",
+			(char *)"ProxySQL: the session has no StarRocks FE connection. Connect again", true);
+		client_myds->DSS = STATE_SLEEP;
+		return false;
+	}
+	mybe = find_backend(conn->parent->myhgc->hid);
+	status = st;
+	return true;
+}
+
+void MySQL_Session::starrocks_reply_ok_of_fe(MySQL_Data_Stream *myds) {
+	MYSQL *mysql = myds->myconn->mysql;
+	myds->DSS = STATE_MARIADB_GENERIC;
+	client_myds->myprot.generate_pkt_OK(true,NULL,NULL,1,0,0,mysql->server_status,mysql_warning_count(mysql),NULL);
+	client_myds->DSS = STATE_SLEEP;
+	status = WAITING_CLIENT_DATA;
+}
+
+int MySQL_Session::handler_again___status_PINGING_SERVER_for_client() {
+	MySQL_Data_Stream *myds = mybe->server_myds;
+	MySQL_Connection *myconn = myds->myconn;
+	int rc = myconn->async_ping(myds->revents);
+	if (rc == 0) {
+		starrocks_client_ping = false;
+		myds->wait_until = 0;
+		starrocks_reply_ok_of_fe(myds);
+		return 0;
+	}
+	if (rc == 1) {
+		if (myds->mypolls == NULL) {
+			thread->mypolls.add(POLLIN|POLLOUT, myds->fd, myds, thread->curtime);
+		}
+		return 0;
+	}
+	// The FE did not answer. The session cannot get another FE connection, so it ends, and the client sees
+	// its connection close as it would see it with the FE.
+	if (rc == -2) {
+		proxy_error("Ping timeout during the ping of a client on %s:%d (timeout %dms)\n",
+			myconn->parent->address, myconn->parent->port, mysql_thread___ping_timeout_server);
+	} else {
+		int myerr = mysql_errno(myconn->mysql);
+		detected_broken_connection(__FILE__ , __LINE__ , __func__ , "during the ping of a client", myconn, myerr, mysql_error(myconn->mysql), true);
+	}
+	myds->destroy_MySQL_Connection_From_Pool(false);
+	myds->fd = 0;
+	return -1;
+}
+
+void MySQL_Session::starrocks_close_backend_stmt(uint64_t stmt_global_id) {
+	MySQL_Connection *conn = starrocks_relay_connection();
+	// A statement that we cannot close now stays open on the FE until the session ends, as with any other client.
+	if (conn == NULL || conn->local_stmts == NULL || conn->async_state_machine != ASYNC_IDLE) return;
+	MySQL_STMTs_local_v14 *stmts = conn->local_stmts;
+	auto s = stmts->global_stmt_to_backend_stmt.find(stmt_global_id);
+	if (s == stmts->global_stmt_to_backend_stmt.end()) return;
+	MYSQL_STMT *stmt = s->second;
+	stmts->global_stmt_to_backend_stmt.erase(s);
+	auto b = stmts->global_stmt_to_backend_ids.find(stmt_global_id);
+	if (b != stmts->global_stmt_to_backend_ids.end()) {
+		stmts->backend_stmt_to_global_ids.erase(b->second);
+		stmts->global_stmt_to_backend_ids.erase(b);
+	}
+	// COM_STMT_CLOSE has no answer, so the connection is idle again as soon as the command is sent.
+	mysql_stmt_close(stmt);
+	GloMyStmt->ref_count_server(stmt_global_id, -1);
 }
 
 bool MySQL_Session::starrocks_fe_left() {

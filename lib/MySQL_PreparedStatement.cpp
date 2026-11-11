@@ -836,10 +836,13 @@ bool MySQL_STMTs_local_v14::client_close(uint32_t client_statement_id) {
 
 MySQL_STMT_Global_info *MySQL_STMT_Manager_v14::add_prepared_statement(
     char *u, char *s, char *q, unsigned int ql,
-    char *fc, MYSQL_STMT *stmt, bool lock) {
+    char *fc, MYSQL_STMT *stmt, bool lock, uint64_t salt) {
 	MySQL_STMT_Global_info *ret = NULL;
 	uint64_t hash = stmt_compute_hash(
 		u, s, q, ql);  // this identifies the prepared statement
+	if (salt) {
+		hash = SpookyHash::Hash64(&salt, sizeof(salt), hash);
+	}
 	if (lock) {
 		pthread_rwlock_wrlock(&rwlock_);
 	}
