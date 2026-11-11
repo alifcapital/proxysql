@@ -2787,12 +2787,6 @@ bool MySQL_Session::handler_again___verify_ldap_user_variable() {
 }
 
 bool MySQL_Session::handler_again___verify_backend_autocommit() {
-	// We want to send SET autocommit only when we can check that it took effect. StarRocks never sets
-	// SERVER_STATUS_AUTOCOMMIT in its OK packets, so IsAutoCommit() cannot match what we set: we would
-	// send SET autocommit again and again and never run the query of the client.
-	if (starrocks_auth_session || mybe->server_myds->myconn->parent->myhgc->attributes.starrocks_backend) {
-		return false;
-	}
 	if (sending_set_autocommit) {
 		// if sending_set_autocommit==true, the next query proxysql is going
 		// to run defines autocommit, for example:
@@ -5212,9 +5206,6 @@ __get_pkts_from_client:
 							break;
 					case STATE_SLEEP:	// only this section can be executed ALSO by mirror
 						command_counters->incr(thread->curtime/1000000);
-						if (mirror == false && session_type == PROXYSQL_SESSION_MYSQL && session_fast_forward == SESSION_FORWARD_TYPE_NONE) {
-							starrocks_release_offline_backends();
-						}
 						if (transaction_persistent_hostgroup==-1) {
 							if (mysql_thread___set_query_lock_on_hostgroup == 0) { // behavior before 2.0.6
 								current_hostgroup=default_hostgroup;
@@ -5988,7 +5979,6 @@ void MySQL_Session::handler_minus1_HandleBackendConnection(MySQL_Data_Stream *my
 		} else {
 			myconn->async_state_machine=ASYNC_IDLE;
 			myds->DSS=STATE_MARIADB_GENERIC;
-			starrocks_release_offline_backend(myds);
 		}
 	}
 }
@@ -9901,7 +9891,6 @@ void MySQL_Session::finishQuery(MySQL_Data_Stream *myds, MySQL_Connection *mycon
 								}
 							}
 						}
-						starrocks_release_offline_backend(myds);
 					}
 }
 
@@ -10246,52 +10235,6 @@ bool MySQL_Session::handle_session_track_capabilities() {
 	return true;
 }
 
-bool MySQL_Session::starrocks_backend_enabled() {
-    const int hostgroup = qpo && qpo->destination_hostgroup >= 0 && transaction_persistent_hostgroup == -1
-        ? qpo->destination_hostgroup : current_hostgroup;
-    return starrocks_hostgroup_enabled(hostgroup);
-}
-
-bool MySQL_Session::starrocks_hostgroup_enabled(int hostgroup) {
-    if (hostgroup < 0) return false;
-    MyHGM->wrlock();
-    MyHGC* group = MyHGM->MyHGC_find(hostgroup);
-    const bool enabled = group && group->attributes.starrocks_backend;
-    MyHGM->wrunlock();
-    return enabled;
-}
-
-// StarRocks hostgroups use multiplex=0, so a session keeps its connection
-// between statements. We fear that a frontend set to OFFLINE_SOFT would then
-// keep its sessions forever and could never be drained. So when the request has
-// ended and the connection is idle, we release it if its server is not ONLINE
-// and the connection holds no transaction and no other session state. We return
-// the connection to the pool because the pool destroys connections of servers
-// that are not ONLINE, so the old connection is never reused.
-bool MySQL_Session::starrocks_release_offline_backend(MySQL_Data_Stream *myds) {
-	if (mirror || myds == NULL || myds->myconn == NULL) return false;
-	// A session whose login the FE took cannot move to another FE: it ends instead,
-	// see starrocks_session_must_end().
-	if (starrocks_auth_session) return false;
-	MySQL_Connection *conn = myds->myconn;
-	if (!conn->parent->myhgc->attributes.starrocks_backend) return false;
-	if (conn->parent->get_status() == MYSQL_SERVER_STATUS_ONLINE) return false;
-	if (conn->async_state_machine != ASYNC_IDLE || !conn->reusable) return false;
-	if (conn->IsActiveTransaction() || conn->MultiplexDisabled(true, false)) return false;
-	myds->wait_until = 0;
-	conn->multiplex_delayed = false;
-	myds->DSS = STATE_NOT_INITIALIZED;
-	myds->return_MySQL_Connection_To_Pool();
-	return true;
-}
-
-void MySQL_Session::starrocks_release_offline_backends() {
-	for (unsigned int i = 0; i < mybes->len; i++) {
-		MySQL_Backend *backend = (MySQL_Backend *)mybes->index(i);
-		starrocks_release_offline_backend(backend->server_myds);
-	}
-}
-
 // ---------------------------------------------------------------------------
 // StarRocks FE authentication (mysql-starrocks_auth_hostgroup)
 //
@@ -10445,7 +10388,10 @@ void MySQL_Session::starrocks_close_backend_stmt(uint64_t stmt_global_id) {
 bool MySQL_Session::starrocks_fe_left() {
 	MySQL_Connection *conn = starrocks_relay_connection();
 	if (conn == NULL) return true;
-	return conn->parent->get_status() != MYSQL_SERVER_STATUS_ONLINE;
+	// We want to replace an FE without cutting its clients, so OFFLINE_SOFT only sends new logins to another FE,
+	// and a session stays on its FE, with its transactions, until the client leaves. An FE that is OFFLINE_HARD,
+	// or shunned with its connections killed, takes its sessions with it.
+	return conn->IsServerOffline();
 }
 
 bool MySQL_Session::starrocks_session_must_end() {
@@ -10461,7 +10407,7 @@ bool MySQL_Session::starrocks_session_must_end() {
 	}
 	MySQL_Connection *conn = starrocks_relay_connection();
 	if (conn) {
-		proxy_info("Closing client connection %s:%d because its StarRocks FE %s:%d is not ONLINE\n",
+		proxy_info("Closing client connection %s:%d because its StarRocks FE %s:%d is offline\n",
 			client_myds->addr.addr, client_myds->addr.port, conn->parent->address, conn->parent->port);
 	} else {
 		proxy_info("Closing client connection %s:%d because its StarRocks FE connection is gone\n",

@@ -7,18 +7,6 @@
 
 #include <string>
 
-static void test_connection_flags() {
-	MySQL_Connection *connection_ptr = new MySQL_Connection();
-	MySQL_Connection& connection = *connection_ptr;
-	ok(!connection.MultiplexDisabled(), "a fresh connection can be multiplexed");
-	connection.set_status(true, STATUS_MYSQL_CONNECTION_NO_MULTIPLEX_HG);
-	ok(connection.MultiplexDisabled(), "hostgroup multiplex=0 disables multiplexing");
-	ok(!connection.MultiplexDisabled(true, false), "hostgroup multiplex=0 can be ignored");
-	connection.set_status(true, STATUS_MYSQL_CONNECTION_TEMPORARY_TABLE);
-	ok(connection.MultiplexDisabled(true, false), "connection state pins the connection when the hostgroup setting is ignored");
-	delete connection_ptr;
-}
-
 // A connection that took the login of a client must not go back to the pool or log in again.
 static void test_relay_connection() {
 	MySQL_Connection *connection_ptr = new MySQL_Connection();
@@ -26,7 +14,7 @@ static void test_relay_connection() {
 	ok(!connection.starrocks_relay, "a fresh connection is not a relay connection");
 	connection.relay_enable();
 	ok(connection.starrocks_relay && !connection.reusable, "a relay connection is never reusable");
-	ok(connection.MultiplexDisabled(true, false), "a relay connection is pinned to its client");
+	ok(connection.MultiplexDisabled(), "a relay connection is pinned to its client");
 	ok(connection.relay.state == PROXYSQL_RELAY_IDLE, "the relay waits for the scramble of the server");
 	ok(connection.userinfo->username != NULL && connection.userinfo->username[0] == '\0',
 		"a relay connection has an empty user name until the client is known");
@@ -38,9 +26,8 @@ static void test_relay_connection() {
 }
 
 int main() {
-	plan(11);
+	plan(7);
 	test_init_minimal();
-	test_connection_flags();
 	test_relay_connection();
 	test_cleanup_minimal();
 	return exit_status();

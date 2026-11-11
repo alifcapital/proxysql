@@ -318,11 +318,7 @@ class MySQL_Connection {
 	bool IsServerOffline();
 	bool IsAutoCommit();
 	bool AutocommitFalse_AndSavepoint();
-	/**
-	 * @param check_hostgroup_setting When false, the hostgroup attribute 'multiplex=0' is not counted as a reason
-	 *  to disable multiplexing, so the result tells whether the connection state alone pins the session to it.
-	 */
-	bool MultiplexDisabled(bool check_delay_token = true, bool check_hostgroup_setting = true);
+	bool MultiplexDisabled(bool check_delay_token = true);
 	bool IsKeepMultiplexEnabledVariables(char *query_digest_text);
 	void ProcessQueryAndSetStatusFlags(char *query_digest_text, bool user_variable_usage_is_safe);
 	void optimize();

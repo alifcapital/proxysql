@@ -115,10 +115,8 @@ class Suite:
                        (self.c["hostgroup"],))[0][0])
 
     def backend_active(self):
-        if not self.c.get("sticky_connection"):
-            return self.used() > 0
-        # A sticky client keeps its FE connection while it reads, so ConnUsed
-        # stays above zero. The FE itself tells whether the query is still running.
+        # A client keeps its FE connection while it reads, so ConnUsed stays above
+        # zero. The FE itself tells whether the query is still running.
         marker = self.c["result_query"][:64].encode()
         return any(row[5] == b"Query" and (row[9] or b"").startswith(marker)
                    for row in sql(self.direct, "SHOW PROCESSLIST"))
@@ -126,12 +124,9 @@ class Suite:
     def backends_idle(self):
         """No FE connection is busy with a fixture query.
 
-        A multiplexed client gives its FE connection back to the pool, so ConnUsed is 0. A sticky
-        client (and any client of the FE authentication) keeps it, so the FE tells whether a
-        fixture query still runs. All fixture queries read TABLE(generate_series(...)).
+        A client keeps its FE connection, so the FE tells whether a fixture query still runs.
+        All fixture queries read TABLE(generate_series(...)).
         """
-        if not self.c.get("sticky_connection"):
-            return self.used() == 0
         return not any(row[5] == b"Query" and b"generate_series" in (row[9] or b"")
                        for row in sql(self.direct, "SHOW PROCESSLIST"))
 
@@ -314,47 +309,6 @@ class Suite:
             directory.chmod(0o700)
             directory.rmdir()
 
-    def oversized_cache(self):
-        names = ("mysql-resultset_spill_enabled", "mysql-threshold_resultset_size")
-        previous = {name: sql(self.admin, "SELECT variable_value FROM global_variables WHERE variable_name=%s", (name,))[0][0] for name in names}
-        rule_id = 941000001
-        assert not sql(self.admin, "SELECT rule_id FROM mysql_query_rules WHERE rule_id=%s", (rule_id,))
-        connection = None
-        def hits():
-            return int(sql(self.admin, "SELECT Variable_Value FROM stats_mysql_global WHERE Variable_Name='Query_Cache_count_GET_OK'")[0][0])
-        try:
-            sql(self.admin, "INSERT INTO mysql_query_rules(rule_id,active,username,match_pattern,cache_ttl,apply) VALUES(%s,1,%s,%s,600000,1)",
-                (rule_id, self.c["proxy"]["user"], "^" + re.escape(self.c["result_query"]) + "$"))
-            sql(self.admin, "LOAD MYSQL QUERY RULES TO RUNTIME")
-            sql(self.admin, "UPDATE global_variables SET variable_value='false' WHERE variable_name='mysql-resultset_spill_enabled'")
-            sql(self.admin, "UPDATE global_variables SET variable_value='268435456' WHERE variable_name='mysql-threshold_resultset_size'")
-            sql(self.admin, "LOAD MYSQL VARIABLES TO RUNTIME")
-            connection = connect(self.c["proxy"], stream=True)
-            cursor = connection.cursor()
-            cursor.execute(self.c["result_query"])
-            expected = fingerprint(cursor)
-            before = hits()
-            cursor.execute(self.c["result_query"])
-            assert fingerprint(cursor) == expected
-            assert hits() > before, "large result was not actually cached"
-            connection.close()
-            connection = None
-            sql(self.admin, "UPDATE global_variables SET variable_value='true' WHERE variable_name='mysql-resultset_spill_enabled'")
-            sql(self.admin, "UPDATE global_variables SET variable_value='1048576' WHERE variable_name='mysql-threshold_resultset_size'")
-            sql(self.admin, "LOAD MYSQL VARIABLES TO RUNTIME")
-            before = hits()
-            self.slow_result()
-            assert hits() == before, "oversized cache entry was copied instead of using bounded spill"
-        finally:
-            if connection is not None:
-                connection.close()
-            for name, value in previous.items():
-                sql(self.admin, "UPDATE global_variables SET variable_value=%s WHERE variable_name=%s", (value, name))
-            sql(self.admin, "LOAD MYSQL VARIABLES TO RUNTIME")
-            sql(self.admin, "DELETE FROM mysql_query_rules WHERE rule_id=%s", (rule_id,))
-            sql(self.admin, "LOAD MYSQL QUERY RULES TO RUNTIME")
-            sql(self.admin, "PROXYSQL FLUSH QUERY CACHE")
-
 
 def main():
     parser = argparse.ArgumentParser()
@@ -375,8 +329,6 @@ def main():
     if config.get("fault_directory"):
         tests.extend([("actual filesystem ENOSPC fails explicitly and recovers", lambda: suite.filesystem_failure("enospc")),
                       ("actual EACCES creation failure cleans and recovers", lambda: suite.filesystem_failure("eacces"))])
-    if config.get("cache_test", True):
-        tests.append(("oversized existing cache entry uses bounded real spill", suite.oversized_cache))
     for variant in config.get("protocol_variants", []):
         assert variant in ("prepared", "compressed", "tls", "multi_results", "late_error"), variant
         tests.append((variant + " ordered result matches direct FE", lambda v=variant: suite.driver_result(v)))

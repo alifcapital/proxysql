@@ -8,9 +8,9 @@ the isolated C++ TAP runner in `test/infra`.
 Run on the Linux host of an isolated ProxySQL process, as its user or root, so
 `/proc/PID/fd` and `/proc/PID/status` are readable. Reserve a dedicated hostgroup
 and frontend listener: aggregate `ConnUsed` is only meaningful without unrelated
-traffic. Disable query cache for this user/query. Register two distinct real FEs
-in that hostgroup and set its `hostgroup_settings` to
-`{"backend_type":"starrocks"}` and `multiplex=0`.
+traffic. Register two distinct real FEs in that hostgroup. ProxySQL runs with
+`mysql-starrocks_auth_hostgroup` set to that hostgroup: the FE authenticates the clients,
+and every client keeps its own FE connection.
 
 Enable `mysql-resultset_spill_enabled`, set
 `mysql-resultset_spill_directory` to a private writable directory,
@@ -61,16 +61,17 @@ no spill or cleanup.
 Implemented acceptance fixtures (execution results must be recorded separately):
 
 * `e2e.py`: paused readers, spill/RSS evidence, disconnect cleanup, disk limits,
-  missing directories, ENOSPC/EACCES when configured, query cache,
+  missing directories, ENOSPC/EACCES when configured,
   prepared/TLS/compressed results, multiple results and a later statement error.
 * `upgrade_drain.py`: OFFLINE_SOFT during an executing slow query, completion on
-  the old FE and subsequent use of the other FE.
-* `sticky_switch.py`: a client keeps one FE connection while other clients churn
-  the pool, a running query survives an FE switch and idle sessions leave the old
-  FE on their next statement, and an open explicit transaction stays on the old
-  FE until `COMMIT`. The hostgroup must have `multiplex=0` (set by `setup.py`)
-  and contain only `backend`; `new_fe` is the second FE that each case adds when
-  it switches.
+  the old FE, the next statement of that client on the old FE, and a new client on
+  the other FE.
+* `sticky_switch.py`: a client keeps one FE connection while other clients run
+  statements; after an FE switch a running query finishes, the running and the idle
+  session stay on the old FE with their FE connections, a new client lands on the
+  `ONLINE` FE, and the old FE is free when its clients leave; an open transaction
+  goes on and commits on the old FE. Each case starts with only `backend` in the
+  hostgroup; `new_fe` is the second FE that each case adds when it switches.
 * `protocol_edges.py`: compressed raw pipelining and COM_QUIT with unread spill.
 * `large_packets.py`: large wire packets across the protocol packet boundary,
   with real spool-file and cleanup evidence. Its Python connector transport
@@ -83,16 +84,13 @@ Implemented acceptance fixtures (execution results must be recorded separately):
 
 ## StarRocks FE authentication
 
-`setup.py --fe-auth` configures ProxySQL for `mysql-starrocks_auth_hostgroup`: it sets
-the variable to the test hostgroup, leaves `mysql_users` empty and gives each server
-row 200 connections, because every client holds one FE connection. The clients log in
-as users of the FE (`root` without a password in `config.example.json`). It cannot be
-combined with `--baseline` or `--multiplexed`, and it writes `"fe_auth": true` to the
-JSON file. Start from a ProxySQL that has no pooled connections (restart it after a
-run with `--multiplexed`), because `fe_auth.py` checks that nothing goes to the pool.
+`setup.py` sets `mysql-starrocks_auth_hostgroup` to the test hostgroup, leaves
+`mysql_users` empty and gives each server row 200 connections, because every client
+holds one FE connection. The clients log in as users of the FE (`root` without a
+password in `config.example.json`). Start from a ProxySQL that has no pooled
+connections, because `fe_auth.py` checks that nothing goes to the pool.
 
 ```sh
-python test/starrocks/setup.py --fe-auth --pid PROXYSQL_PID --output /tmp/starrocks-test.json --spill-directory /tmp/private-spill
 python test/starrocks/fe_auth.py /tmp/starrocks-test.json --connector-jar /path/to/mysql-connector-j-8.0.33.jar
 ```
 
@@ -121,17 +119,12 @@ python test/starrocks/fe_auth.py /tmp/starrocks-test.json --connector-jar /path/
   and prepared statements of one text in two databases. The FE itself sometimes misses
   `KILL QUERY` of a running query, also on a direct connection, so the `KILL QUERY` case
   can fail without a fault of ProxySQL.
-* `sticky_switch.py` and `upgrade_drain.py` read `fe_auth` from the JSON file. In
-  that mode a running query finishes on the drained FE and the client gets the whole
-  result, then ProxySQL closes the client connection; an idle client and an open
-  transaction are closed too; and a new connection lands on the `ONLINE` FE.
 * `compression_framing.py` reads a million short rows through a compressed connection with
   mysql-connector-python and compares them with a direct FE. The result is spilled, and the
   blocks of the spill have any size, so without the fix many compressed packets ended inside a
-  MySQL packet header and the driver failed every time. It works with every setup.
+  MySQL packet header and the driver failed every time.
 * `transactions.py` sends statements around explicit transactions (after a user variable or
-  `SET autocommit=0`, `COMMIT`, `ROLLBACK`) and fails if one gets no answer. It runs
-  against the sticky setup and against `--fe-auth`.
+  `SET autocommit=0`, `COMMIT`, `ROLLBACK`) and fails if one gets no answer.
 * `e2e.py`, `large_packets.py`, `large_packets_jdbc.py`, `protocol_edges.py` and
   `concurrent_spill.py` run unchanged against the same setup. The two last ones wait
   for the FE query to end, as the clients keep their FE connections.
@@ -145,13 +138,9 @@ python test/starrocks/concurrent_spill.py /tmp/starrocks-test.json --clients 8 -
 python test/starrocks/large_packets_jdbc.py --config /tmp/starrocks-test.json --connector-jar /path/to/mysql-connector-j-8.0.33.jar --proxy-port 6033
 ```
 
-`setup.py` gives the hostgroup `multiplex=0`, as the operator documentation
-prescribes, and records `sticky_connection` in the JSON file. `e2e.py`,
-`upgrade_drain.py` and `sticky_switch.py` are written for that mode.
 `protocol_edges.py` and `concurrent_spill.py` wait until the FE query has ended while
-the client has not read the result. With a multiplexed hostgroup they see the FE
-connection go back to the pool (`ConnUsed` is 0); with a sticky one, or with the FE
-authentication, they look at the FE process list instead.
+the client has not read the result. The client keeps its FE connection, so they look
+at the FE process list.
 
 Run fixtures serially when they share a listener or hostgroup: migration cases
 change server status. Presence of a fixture or an example command does not
