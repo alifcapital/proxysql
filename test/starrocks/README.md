@@ -117,9 +117,7 @@ python test/starrocks/fe_auth.py /tmp/starrocks-test.json --connector-jar /path/
   through ProxySQL with a direct FE connection: `USE` and `COM_INIT_DB` with a catalog and
   the FE error on `COM_INIT_DB`, a `SET` that the FE refuses, `SET CATALOG` with `USE`,
   queries such as `SELECT @@version_comment` and `USER()`, `COM_PING`, `COM_FIELD_LIST`,
-  and prepared statements of one text in two databases. The FE itself sometimes misses
-  `KILL QUERY` of a running query, also on a direct connection, so the `KILL QUERY` case
-  can fail without a fault of ProxySQL.
+  and prepared statements of one text in two databases.
 * `compression_framing.py` reads a million short rows through a compressed connection with
   mysql-connector-python and compares them with a direct FE. The result is spilled, and the
   blocks of the spill have any size, so without the fix many compressed packets ended inside a
