@@ -7607,7 +7607,7 @@ bool MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 	if (starrocks_auth_session) {
 		// The FE runs SET and SHOW WARNINGS of this client and keeps their state, see starrocks_auth_session.
 		reset_warning_hostgroup_flag_and_release_connection();
-		goto __exit_set_destination_hostgroup;
+		goto __starrocks_proxysql_own_queries;
 	}
 
 	// handle warnings
@@ -8565,6 +8565,9 @@ bool MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 		return false;
 	}
 
+__starrocks_proxysql_own_queries:
+	// A client whom the FE authenticated still gets the connection id of ProxySQL here, as in the greeting,
+	// because KILL of that id is what ProxySQL translates to the FE connection id, see starrocks_rewrite_kill().
 	// handle case #1797
 	// handle case #2564
        if ((pkt->size==SELECT_CONNECTION_ID_LEN+5 && *((char *)(pkt->ptr)+4)==(char)0x03 && strncasecmp((char *)SELECT_CONNECTION_ID,(char *)pkt->ptr+5,pkt->size-5)==0)) {
@@ -8611,7 +8614,8 @@ bool MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 	}
 
 	// handle case #1421 , about LAST_INSERT_ID
-	if (CurrentQuery.QueryParserArgs.digest_text) {
+	// The FE answers it for a client whom the FE authenticated, see starrocks_auth_session.
+	if (!starrocks_auth_session && CurrentQuery.QueryParserArgs.digest_text) {
 		char *dig=CurrentQuery.QueryParserArgs.digest_text;
 		if (strcasestr(dig,"LAST_INSERT_ID") || strcasestr(dig,"@@IDENTITY")) {
 			// we need to try to execute it where the last write was successful
@@ -8701,8 +8705,9 @@ bool MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 	}
 
 	// handle case, about SELECT_MYSQL_VERSION or SELECT VERSION()
-	if ((pkt->size==SELECT_MYSQL_VERSION_LEN+5 && *((char *)(pkt->ptr)+4)==(char)0x03 && strncasecmp((char *)SELECT_MYSQL_VERSION,(char *)pkt->ptr+5,pkt->size-5)==0) ||
-		(pkt->size==SELECT_MYSQL_VERSION_FUNC_LEN+5 && *((char *)(pkt->ptr)+4)==(char)0x03 && strncasecmp((char *)SELECT_MYSQL_VERSION_FUNC,(char *)pkt->ptr+5,pkt->size-5)==0)) {
+	// The FE answers it for a client whom the FE authenticated, see starrocks_auth_session.
+	if (!starrocks_auth_session && (pkt->size==SELECT_MYSQL_VERSION_LEN+5 && *((char *)(pkt->ptr)+4)==(char)0x03 && strncasecmp((char *)SELECT_MYSQL_VERSION,(char *)pkt->ptr+5,pkt->size-5)==0) ||
+		(pkt->size==SELECT_MYSQL_VERSION_FUNC_LEN+5 && *((char *)(pkt->ptr)+4)==(char)0x03 && strncasecmp((char *)SELECT_MYSQL_VERSION_FUNC,(char *)pkt->ptr+5,pkt->size-5)==0))) {
 		char *version_to_return = NULL;
 		int mode = mysql_thread___select_version_forwarding;  // SelectVersionForwardingMode enum values
 
@@ -8788,7 +8793,8 @@ bool MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 			return true;
 		}
 	//}
-	if (qpo->cache_ttl>0 && ((prepare_stmt_type & ps_type_prepare_stmt) == 0)) {
+	// The query cache would answer for the FE, see starrocks_auth_session.
+	if (!starrocks_auth_session && qpo->cache_ttl>0 && ((prepare_stmt_type & ps_type_prepare_stmt) == 0)) {
 		bool deprecate_eof_active = client_myds->myconn->options.client_flag & CLIENT_DEPRECATE_EOF;
 		uint32_t resbuf=0;
 		unsigned char *aa= GloMyQC->get(
@@ -10493,9 +10499,9 @@ void MySQL_Session::starrocks_login_feed(bool& wrong_pass) {
 		starrocks_login_fail(2013, "HY000", "ProxySQL: the StarRocks FE connection is not ready for the login", wrong_pass);
 		return;
 	}
-	// A client without a database gets the default schema, like with any other login.
-	const std::string db = (starrocks_login_has_db && !starrocks_login_db.empty())
-		? starrocks_login_db : std::string(mysql_thread___default_schema);
+	// The FE gets the database of the client as it is. A client without one has no database on the FE, as on a
+	// direct connection, so we do not give it the default schema of ProxySQL, see starrocks_auth_session.
+	const std::string db = starrocks_login_has_db ? starrocks_login_db : std::string();
 	MySQL_Connection_userinfo *userinfo = client_myds->myconn->userinfo;
 	userinfo->set(const_cast<char *>(starrocks_login_user.c_str()), const_cast<char *>(""), NULL, NULL);
 	userinfo->set_schemaname(const_cast<char *>(db.c_str()), db.size());

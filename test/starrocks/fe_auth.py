@@ -305,6 +305,140 @@ class Suite:
         finally:
             connection.close()
 
+    def command_error(self, function):
+        try:
+            function()
+        except pymysql.err.MySQLError as error:
+            return error.args
+        raise AssertionError("the command was accepted")
+
+    def use_catalog_and_database(self):
+        """USE `catalog`.`database` and COM_INIT_DB catalog.database run on the FE."""
+        connection = login(self.config, PASSWORD_USER, PASSWORD)
+        try:
+            first = fe_connection_id(connection)
+            sql(connection, "USE `default_catalog`.`information_schema`")
+            assert sql(connection, "SELECT DATABASE()") == ((b"information_schema",),)
+            connection.select_db("default_catalog.information_schema")
+            assert sql(connection, "SELECT DATABASE()") == ((b"information_schema",),)
+            assert fe_connection_id(connection) == first
+        finally:
+            connection.close()
+
+    def init_db_error_keeps_the_session(self):
+        """The FE error on COM_INIT_DB reaches the client, and the session goes on in its database."""
+        connection = login(self.config, PASSWORD_USER, PASSWORD)
+        direct = direct_login(self.config, PASSWORD_USER, PASSWORD)
+        try:
+            first = fe_connection_id(connection)
+            sql(connection, "USE information_schema")
+            through = self.command_error(lambda: connection.select_db("px_no_such_catalog`.x"))
+            oracle = self.command_error(lambda: direct.select_db("px_no_such_catalog`.x"))
+            assert through == oracle, ("the FE error must reach the client unchanged", through, oracle)
+            assert sql(connection, "SELECT DATABASE()") == ((b"information_schema",),)
+            assert fe_connection_id(connection) == first
+        finally:
+            connection.close()
+            direct.close()
+
+    def set_error_comes_with_the_set(self):
+        """A SET that the FE refuses gets the FE error itself, and the next query runs."""
+        connection = login(self.config, PASSWORD_USER, PASSWORD)
+        direct = direct_login(self.config, PASSWORD_USER, PASSWORD)
+        try:
+            through = self.command_error(lambda: sql(connection, "SET max_execution_time = 1000"))
+            oracle = self.command_error(lambda: sql(direct, "SET max_execution_time = 1000"))
+            assert through == oracle, ("the FE error must answer the SET", through, oracle)
+            assert sql(connection, "SELECT 1") == ((1,),)
+        finally:
+            connection.close()
+            direct.close()
+
+    def set_catalog_then_use(self):
+        """SET CATALOG resets the database on the FE, and USE of the same database sets it again."""
+        statements = ("USE information_schema", "SET CATALOG default_catalog", "SELECT DATABASE()",
+                      "USE information_schema", "SELECT DATABASE()")
+        results = []
+        for connect_to in (login, direct_login):
+            connection = connect_to(self.config, PASSWORD_USER, PASSWORD)
+            try:
+                results.append([sql(connection, statement) for statement in statements])
+            finally:
+                connection.close()
+        assert results[0] == results[1], ("the session must follow the FE", results)
+        assert results[0][-1] == ((b"information_schema",),), results
+
+    def answers_come_from_the_fe(self):
+        """Queries that ProxySQL could answer itself get the answer of the FE."""
+        connection = login(self.config, PASSWORD_USER, PASSWORD)
+        direct = direct_login(self.config, PASSWORD_USER, PASSWORD)
+        try:
+            for statement in ("SELECT @@version_comment LIMIT 1", "SELECT DATABASE()"):
+                assert sql(connection, statement) == sql(direct, statement), statement
+            assert b"@" in sql(connection, "select USER()")[0][0], "USER() of the FE has a host"
+        finally:
+            connection.close()
+            direct.close()
+
+    def ping_reaches_the_fe(self):
+        """COM_PING is answered by the FE, so a ping finds out that the FE connection is gone."""
+        connection = login(self.config, PASSWORD_USER, PASSWORD)
+        try:
+            connection.ping(reconnect=False)
+            identifier = fe_connection_id(connection)
+            sql(self.oracle, "KILL %d" % identifier)
+            eventually(lambda: identifier not in fe_users(self.oracle), 10)
+            try:
+                connection.ping(reconnect=False)
+            except pymysql.err.Error:
+                return None
+            raise AssertionError("the ping succeeded after the FE connection ended")
+        finally:
+            try:
+                connection.close()
+            except Exception:
+                pass
+
+    def prepared_statements_follow_the_database(self):
+        """A statement prepared twice in two databases runs as on a direct FE connection."""
+        import mysql.connector
+        databases = ("px_fe_auth_ps1", "px_fe_auth_ps2")
+        for database in databases:
+            sql(self.oracle, "CREATE DATABASE IF NOT EXISTS %s" % database)
+        try:
+            sql(self.oracle, "CREATE TABLE IF NOT EXISTS %s.t (a INT) DUPLICATE KEY(a) DISTRIBUTED BY HASH(a) "
+                "PROPERTIES('replication_num'='1')" % databases[0])
+            sql(self.oracle, "CREATE TABLE IF NOT EXISTS %s.t (a INT, b VARCHAR(8)) DUPLICATE KEY(a) DISTRIBUTED BY HASH(a) "
+                "PROPERTIES('replication_num'='1')" % databases[1])
+            sql(self.oracle, "INSERT INTO %s.t VALUES (1)" % databases[0])
+            sql(self.oracle, "INSERT INTO %s.t VALUES (2, 'two')" % databases[1])
+            results = []
+            for endpoint in (self.config["proxy"], self.config["backend"]):
+                options = dict(endpoint)
+                options.update(user=self.config["proxy"]["user"], password=self.config["proxy"]["password"])
+                connection = mysql.connector.connect(**options, use_pure=True, ssl_disabled=True, autocommit=True)
+                try:
+                    run = []
+                    first = connection.cursor(prepared=True)
+                    connection.cmd_query("USE %s" % databases[0])
+                    first.execute("SELECT * FROM t")
+                    run.append(first.fetchall())
+                    connection.cmd_query("USE %s" % databases[1])
+                    second = connection.cursor(prepared=True)
+                    second.execute("SELECT * FROM t")
+                    run.append(second.fetchall())
+                    first.execute("SELECT * FROM t")
+                    run.append(first.fetchall())
+                    first.close()
+                    second.close()
+                    results.append(run)
+                finally:
+                    connection.close()
+            assert results[0] == results[1], ("prepared statements must run as on the FE", results)
+        finally:
+            for database in databases:
+                sql(self.oracle, "DROP DATABASE IF EXISTS %s FORCE" % database)
+
     def disconnects_during_login(self):
         """A client that leaves before the FE login ends does not leave an FE connection behind."""
         host, port = self.config["proxy"]["host"], self.config["proxy"]["port"]
@@ -665,6 +799,13 @@ class Suite:
                 ("Connector/J login in every variant", self.jdbc_login),
                 ("a client with another authentication plugin switches to mysql_native_password", self.cli_auth_switch),
                 ("session state stays on the FE connection of the client", self.session_state_stays),
+                ("USE and COM_INIT_DB with a catalog run on the FE", self.use_catalog_and_database),
+                ("the FE error on COM_INIT_DB reaches the client and the session goes on", self.init_db_error_keeps_the_session),
+                ("a SET that the FE refuses gets the FE error itself", self.set_error_comes_with_the_set),
+                ("SET CATALOG and USE follow the FE", self.set_catalog_then_use),
+                ("queries that ProxySQL could answer get the answer of the FE", self.answers_come_from_the_fe),
+                ("COM_PING is answered by the FE", self.ping_reaches_the_fe),
+                ("prepared statements in two databases run as on the FE", self.prepared_statements_follow_the_database),
                 ("clients that leave during the login leave no FE connection", self.disconnects_during_login),
                 ("every client holds its own FE connection and nothing is pooled", self.one_fe_connection_per_client),
                 ("no FE connection serves two clients", self.no_reuse_over_many_logins),

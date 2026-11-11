@@ -149,6 +149,22 @@ What to know when you set it up:
 * Query rules must not send these clients to another hostgroup. ProxySQL has no
   password for a connection there, so the client gets an error and its connection
   ends.
+* The FE keeps the whole session state of the client, and ProxySQL keeps none. ProxySQL
+  sends every command of the client to the FE and gives the client the answer of the
+  FE: `USE`, `COM_INIT_DB` (an error of the FE leaves the session as it was), `SET` of
+  any variable, `COMMIT`, `ROLLBACK`, `SHOW WARNINGS`, `COM_PING`, `SELECT VERSION()`,
+  `LAST_INSERT_ID()` and the other queries that ProxySQL answers itself for its own users.
+  It sends nothing of its own before a request, and the query cache is not used. A client
+  without a database at login has no database on the FE, as on a direct connection.
+* Each prepare of a client is a statement of its own on the FE, and `COM_STMT_CLOSE`
+  closes it there. ProxySQL does not know the catalog and the database of the FE, so it
+  does not share prepared statements between clients or between prepares of one client.
+* ProxySQL still answers a few commands itself: `SELECT CONNECTION_ID()` and the
+  greeting carry the connection id of ProxySQL (see `KILL` below), `PROXYSQL INTERNAL`
+  commands, `SHOW STATUS LIKE 'Ssl_version'` (about the TLS between the client and
+  ProxySQL), the refusal of `LOAD DATA LOCAL INFILE`, and the commands that the FE does
+  not support: `COM_SET_OPTION`, `COM_STATISTICS`, `COM_REFRESH`, `COM_PROCESS_KILL` and
+  `COM_FIELD_LIST`.
 
 Stopping a query works as with a plain MySQL server. A client sends `KILL QUERY id`
 or `KILL id` over a new connection (the `mysql` client does it on Ctrl+C, and
@@ -179,8 +195,7 @@ What is not supported in this version:
   drop the FE connection of the client, and ProxySQL cannot log in again. The client
   has to disconnect and connect again as the other user.
 * Per user limits (`max_connections` of `mysql_users`), user attributes, default
-  schemas of `mysql_users` and `fast_forward`. A client without a database gets
-  `mysql-default_schema`.
+  schemas of `mysql_users` and `fast_forward`.
 * TLS from ProxySQL to the FE (`use_ssl` of the server row) is not tested.
 
 ## Switch a frontend
