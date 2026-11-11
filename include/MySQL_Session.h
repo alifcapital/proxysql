@@ -427,17 +427,6 @@ class MySQL_Session: public Base_Session<MySQL_Session, MySQL_Data_Stream, MySQL
 	size_t user_variable_replay_batch_index { 0 };
 	std::optional<UserVariableSetAnalysis> pending_user_variable_set;
 	bool current_query_user_variable_safe { false };
-	bool starrocks_backend_enabled();
-	bool starrocks_hostgroup_enabled(int hostgroup);
-	/**
-	 * @brief Releases the idle backend connection of a StarRocks hostgroup whose server is not ONLINE.
-	 * @details The release happens only if the connection holds no transaction and no other session state
-	 *  (the hostgroup attribute 'multiplex=0' alone does not count). The next statement of the session then
-	 *  gets a connection to an ONLINE server.
-	 * @return True if the connection was released.
-	 */
-	bool starrocks_release_offline_backend(MySQL_Data_Stream *myds);
-	void starrocks_release_offline_backends();
 	bool current_query_user_variable_unsafe_fallback { false };
 	bool current_query_user_variable_context_change { false };
 	bool user_variable_tracking_latched { false };
@@ -612,6 +601,14 @@ class MySQL_Session: public Base_Session<MySQL_Session, MySQL_Data_Stream, MySQL
 	 * @details Set when the client connects while @c mysql-starrocks_auth_hostgroup is 0 or more.
 	 *  ProxySQL holds no password for such a client. The FE connection that took its login
 	 *  belongs to the session for its whole life, and the session ends when that connection ends or its FE leaves.
+	 *
+	 *  The FE keeps the whole session state of such a client: catalog, database, session and user variables,
+	 *  transactions, prepared statements. We fear that any state that ProxySQL keeps on its own differs from the
+	 *  state on the FE. So ProxySQL sends every command of the client to the FE and gives the client the answer
+	 *  of the FE. It does not answer for the FE and does not send the FE commands of its own. ProxySQL handles
+	 *  only what the FE cannot: the connection id in KILL, the spill of results, the end of the session when
+	 *  the FE leaves, and the commands that the FE does not support (COM_SET_OPTION, COM_STATISTICS,
+	 *  COM_REFRESH, COM_PROCESS_KILL), which it answers as for any other client.
 	 */
 	bool starrocks_auth_session;
 	/**
@@ -665,7 +662,7 @@ class MySQL_Session: public Base_Session<MySQL_Session, MySQL_Data_Stream, MySQL
 	void starrocks_login_complete(bool& wrong_pass);
 	/// Returns the FE connection that took the login of the client, or NULL if the session has none.
 	MySQL_Connection *starrocks_relay_connection();
-	/// Tells if the FE connection of the session is gone or its FE is not ONLINE.
+	/// Tells if the FE connection of the session is gone or its FE is offline (not when it is only OFFLINE_SOFT).
 	bool starrocks_fe_left();
 	/// Opens the FE connection for the login. Returns false when it fails; the client then got an error.
 	bool starrocks_login_open(bool& wrong_pass);
@@ -673,10 +670,38 @@ class MySQL_Session: public Base_Session<MySQL_Session, MySQL_Data_Stream, MySQL
 	void starrocks_login_feed(bool& wrong_pass);
 	/**
 	 * @brief Tells if a session of a client whom the StarRocks FE authenticates must end now.
-	 * @details It must end when its FE connection is gone, or its FE is not ONLINE, and the client has
-	 *  read the response of the last request. A request that runs finishes on its FE first.
+	 * @details It must end when its FE connection is gone, or its FE is offline (see starrocks_fe_left()),
+	 *  and the client has read the response of the last request. A request that runs finishes on its FE first.
 	 */
 	bool starrocks_session_must_end();
+	/**
+	 * @brief True while the FE connection runs a COM_INIT_DB or a COM_PING that the client sent.
+	 * @details The steps CHANGING_SCHEMA and PINGING_SERVER then give the answer of the FE to the client and
+	 *  wait for the next request, instead of going on with a query or ending a ping session.
+	 */
+	bool starrocks_client_init_db;
+	/// The database name of the COM_INIT_DB that the client sent, as it is.
+	std::string starrocks_init_db_name;
+	bool starrocks_client_ping;
+	/**
+	 * @brief Starts to run a command of the client on the FE connection of the session, in the step 'st'.
+	 * @return False when the session has no FE connection; the client then got an error and the session ends.
+	 */
+	bool starrocks_forward_to_fe(enum session_status st);
+	/// Gives the client the OK of the FE for its COM_INIT_DB or COM_PING, and waits for the next request.
+	void starrocks_reply_ok_of_fe(MySQL_Data_Stream *myds);
+	/// The step PINGING_SERVER for a COM_PING of the client. Returns -1 when the session must end.
+	int handler_again___status_PINGING_SERVER_for_client();
+	/// The step STARROCKS_FIELD_LIST: gives the client the columns that the FE listed, or the error of the FE.
+	bool handler_again___status_STARROCKS_FIELD_LIST(int *_rc);
+	/// Counts the prepared statements of the session, to make each of them a statement of its own, see starrocks_auth_session.
+	uint32_t starrocks_prepare_count;
+	/**
+	 * @brief Closes on the FE the statement that the client closed.
+	 * @details Each prepare of a client whom the FE authenticates is a statement of its own on the FE. Without
+	 *  this, the statements that the client closed would stay open on the FE until the session ends.
+	 */
+	void starrocks_close_backend_stmt(uint64_t stmt_global_id);
 	/**
 	 * @brief Failure channel from CONNECTING_SERVER back to the pass-through
 	 * Phase B handler.

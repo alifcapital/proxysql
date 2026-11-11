@@ -485,6 +485,7 @@ MySQL_Connection::MySQL_Connection() {
 
 	compression_pkt_id=0;
 	mysql_result=NULL;
+	list_fields_result=NULL;
 	query.ptr=NULL;
 	query.length=0;
 	query.stmt=NULL;
@@ -528,6 +529,10 @@ MySQL_Connection::~MySQL_Connection() {
 	}
 	if (local_stmts) {
 		delete local_stmts;
+	}
+	if (list_fields_result) {
+		mysql_free_result(list_fields_result);
+		list_fields_result = NULL;
 	}
 	if (mysql) {
 		// always decrease the counter
@@ -1214,12 +1219,25 @@ void MySQL_Connection::ping_cont(short event) {
 void MySQL_Connection::initdb_start() {
 	PROXY_TRACE();
 	MySQL_Connection_userinfo *client_ui=myds->sess->client_myds->myconn->userinfo;
-	async_exit_status = mysql_select_db_start(&interr,mysql,client_ui->schemaname);
+	// A COM_INIT_DB of a client whom the StarRocks FE authenticated goes to the FE with its own name.
+	const char *db = myds->sess->starrocks_client_init_db ? myds->sess->starrocks_init_db_name.c_str() : client_ui->schemaname;
+	async_exit_status = mysql_select_db_start(&interr,mysql,db);
 }
 
 void MySQL_Connection::initdb_cont(short event) {
 	proxy_debug(PROXY_DEBUG_MYSQL_PROTOCOL, 6,"event=%d\n", event);
 	async_exit_status = mysql_select_db_cont(&interr,mysql, mysql_status(event, true));
+}
+
+void MySQL_Connection::list_fields_start() {
+	PROXY_TRACE();
+	list_fields_result = NULL;
+	async_exit_status = mysql_list_fields_start(&list_fields_result, mysql, list_fields_table.c_str(), NULL);
+}
+
+void MySQL_Connection::list_fields_cont(short event) {
+	proxy_debug(PROXY_DEBUG_MYSQL_PROTOCOL, 6,"event=%d\n", event);
+	async_exit_status = mysql_list_fields_cont(&list_fields_result, mysql, mysql_status(event, true));
 }
 
 void MySQL_Connection::set_option_start() {
@@ -1539,7 +1557,8 @@ handler_again:
 				ping_cont(event);
 			}
 			if (async_exit_status) {
-				if (myds->sess->thread->curtime >= myds->wait_until) {
+				// wait_until 0 is a ping without a deadline (the ping of a client whom the StarRocks FE authenticated).
+				if (myds->wait_until && myds->sess->thread->curtime >= myds->wait_until) {
 					NEXT_IMMEDIATE(ASYNC_PING_TIMEOUT);
 				} else {
 					next_event(ASYNC_PING_CONT);
@@ -2106,6 +2125,33 @@ handler_again:
 			MyHGM->p_update_mysql_error_counter(p_mysql_error_type::mysql, parent->myhgc->hid, parent->address, parent->port, mysql_errno(mysql));
 			//fprintf(stderr,"%s\n",mysql_error(mysql));
 			break;
+		case ASYNC_LIST_FIELDS_START:
+			list_fields_start();
+			if (async_exit_status) {
+				next_event(ASYNC_LIST_FIELDS_CONT);
+			} else {
+				NEXT_IMMEDIATE(ASYNC_LIST_FIELDS_END);
+			}
+			break;
+		case ASYNC_LIST_FIELDS_CONT:
+			list_fields_cont(event);
+			if (async_exit_status) {
+				next_event(ASYNC_LIST_FIELDS_CONT);
+			} else {
+				NEXT_IMMEDIATE(ASYNC_LIST_FIELDS_END);
+			}
+			break;
+		case ASYNC_LIST_FIELDS_END:
+			// mysql_list_fields() returns NULL only on an error; an empty list is a result without fields.
+			if (list_fields_result == NULL) {
+				NEXT_IMMEDIATE(ASYNC_LIST_FIELDS_FAILED);
+			} else {
+				NEXT_IMMEDIATE(ASYNC_LIST_FIELDS_SUCCESSFUL);
+			}
+			break;
+		case ASYNC_LIST_FIELDS_SUCCESSFUL:
+		case ASYNC_LIST_FIELDS_FAILED:
+			break;
 		case ASYNC_SET_OPTION_START:
 			set_option_start();
 			if (async_exit_status) {
@@ -2543,6 +2589,34 @@ int MySQL_Connection::async_change_user(short event) {
 	return 1;
 }
 
+int MySQL_Connection::async_list_fields(short event) {
+	PROXY_TRACE();
+	assert(mysql);
+	assert(ret_mysql);
+	server_status=parent->get_status(); // we copy it here to avoid race condition. The caller will see this
+	switch (async_state_machine) {
+		case ASYNC_LIST_FIELDS_SUCCESSFUL:
+			async_state_machine=ASYNC_IDLE;
+			return 0;
+		case ASYNC_LIST_FIELDS_FAILED:
+			return -1;
+		case ASYNC_IDLE:
+			async_state_machine=ASYNC_LIST_FIELDS_START;
+		default:
+			handler(event);
+			break;
+	}
+	switch (async_state_machine) {
+		case ASYNC_LIST_FIELDS_SUCCESSFUL:
+			async_state_machine=ASYNC_IDLE;
+			return 0;
+		case ASYNC_LIST_FIELDS_FAILED:
+			return -1;
+		default:
+			return 1;
+	}
+}
+
 int MySQL_Connection::async_select_db(short event) {
 	PROXY_TRACE();
 	assert(mysql);
@@ -2790,9 +2864,6 @@ bool MySQL_Connection::IsKnownActiveTransaction() {
 
 bool MySQL_Connection::IsActiveTransaction() {
 	bool ret=false;
-	if (status_flags & STATUS_MYSQL_CONNECTION_STARROCKS_TRANSACTION) {
-		return true;
-	}
 	if (mysql) {
 		ret = (mysql->server_status & SERVER_STATUS_IN_TRANS);
 		if (ret == false && (mysql)->net.last_errno && unknown_transaction_status == true) {
@@ -2840,18 +2911,14 @@ bool MySQL_Connection::IsAutoCommit() {
 	return ret;
 }
 
-bool MySQL_Connection::MultiplexDisabled(bool check_delay_token, bool check_hostgroup_setting) {
+bool MySQL_Connection::MultiplexDisabled(bool check_delay_token) {
 // status_flags stores information about the status of the connection
 // can be used to determine if multiplexing can be enabled or not
 	bool ret=false;
-	uint32_t pinning_flags = STATUS_MYSQL_CONNECTION_USER_VARIABLE | STATUS_MYSQL_CONNECTION_PREPARED_STATEMENT |
+	if (status_flags & (STATUS_MYSQL_CONNECTION_USER_VARIABLE | STATUS_MYSQL_CONNECTION_PREPARED_STATEMENT |
 		STATUS_MYSQL_CONNECTION_LOCK_TABLES | STATUS_MYSQL_CONNECTION_TEMPORARY_TABLE | STATUS_MYSQL_CONNECTION_GET_LOCK | STATUS_MYSQL_CONNECTION_NO_MULTIPLEX |
-		STATUS_MYSQL_CONNECTION_SQL_LOG_BIN0 | STATUS_MYSQL_CONNECTION_FOUND_ROWS |
-		STATUS_MYSQL_CONNECTION_HAS_SAVEPOINT | STATUS_MYSQL_CONNECTION_HAS_WARNINGS;
-	if (check_hostgroup_setting) {
-		pinning_flags |= STATUS_MYSQL_CONNECTION_NO_MULTIPLEX_HG;
-	}
-	if (status_flags & pinning_flags) {
+		STATUS_MYSQL_CONNECTION_SQL_LOG_BIN0 | STATUS_MYSQL_CONNECTION_FOUND_ROWS | STATUS_MYSQL_CONNECTION_NO_MULTIPLEX_HG |
+		STATUS_MYSQL_CONNECTION_HAS_SAVEPOINT | STATUS_MYSQL_CONNECTION_HAS_WARNINGS) ) {
 		ret=true;
 	}
 	if (check_delay_token && auto_increment_delay_token) return true;

@@ -73,7 +73,6 @@ void BaseHGC<HGC>::reset_attributes() {
 	attributes.monitor_slave_lag_when_null = -1;
 	attributes.default_query_timeout = -1;
 	attributes.multiplex = true;
-	attributes.starrocks_backend = false;
 	attributes.connection_warming = false;
 	free(attributes.init_connect);
 	attributes.init_connect = NULL;

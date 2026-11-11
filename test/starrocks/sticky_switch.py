@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """Verify that a client keeps its FE connection, and leaves a drained FE safely.
 
-With ProxySQL authentication (the default) a client moves to another FE with the
-first request after its FE leaves. When config["fe_auth"] is true (setup.py
---fe-auth) the FE authenticates the clients and a session cannot move: the running
-request finishes on the old FE, the client gets the whole result, and then ProxySQL
-closes the client connection, idle clients included.
+The FE authenticates the clients, so a session cannot move to another FE. When the
+old FE is set to OFFLINE_SOFT, new logins go to the ONLINE FE, and every session of
+the old FE, with its running request and its open transaction, stays there until the
+client disconnects.
 
-The hostgroup must have the attribute multiplex=0 and backend_type=starrocks.
 Every case starts with config["backend"] as the only server of the hostgroup.
 config["new_fe"] is a second FE of the same cluster (host and port) that the
 case adds to the hostgroup when it switches. The original rows of the hostgroup
@@ -18,11 +16,14 @@ from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import socket
+import threading
 import traceback
 
 from e2e import connect, sql, eventually
 
 DATABASE = "sticky_switch_test"
+# Runs on the compute nodes until it is stopped.
+HEAVY_QUERY = "SELECT count(*) FROM TABLE(generate_series(1,100000000000)) t WHERE generate_series % 7 = 3"
 
 
 def physical_id(connection):
@@ -76,10 +77,6 @@ def closed_by_proxysql(connection, timeout=20):
         return False
 
 
-def old_fe_released(admin, config):
-    return pool_used(admin, config, config["backend"]["host"], config["backend"]["port"]) == 0
-
-
 class Suite:
     def __init__(self, config):
         self.config = config
@@ -97,7 +94,7 @@ class Suite:
             self.results.append((False, name))
 
     def connection_stays(self):
-        # Other clients keep the pool busy, so a multiplexed statement would change connections.
+        # Other clients keep FE connections busy; the client must stay on its own one.
         clients = [connect(self.config["proxy"]) for _ in range(6)]
         try:
             with ThreadPoolExecutor(max_workers=len(clients)) as pool:
@@ -115,41 +112,13 @@ class Suite:
             for c in clients:
                 c.close()
 
-    def switch_with_running_query(self):
-        client = connect(self.config["proxy"])
-        idle = connect(self.config["proxy"])
-        try:
-            query = "SELECT sleep(8), 'running-on-old-fe'"
-            old_id = physical_id(client)
-            idle_old_id = physical_id(idle)
-            thread_id, idle_thread_id = client.thread_id(), idle.thread_id()
-            with ThreadPoolExecutor(max_workers=1) as pool:
-                running = pool.submit(sql, client, query)
-                eventually(lambda: pool_used(self.admin, self.config, self.config["backend"]["host"],
-                                             self.config["backend"]["port"]) >= 2, 5)
-                switch_to_new_fe(self.admin, self.config)
-                assert not running.done(), "the query ended before the switch; nothing was tested"
-                result = running.result(timeout=60)
-                assert len(result) == 1 and result[0][1:] == (b"running-on-old-fe",), ("the running query lost its result", result)
-            # The running client released its connection when the query ended; the idle one has not sent anything.
-            eventually(lambda: pool_used(self.admin, self.config, self.config["backend"]["host"],
-                                         self.config["backend"]["port"]) == 1, 5)
-            assert physical_id(client) != old_id, "the next statement stayed on the old FE"
-            assert physical_id(idle) != idle_old_id, "the idle client's next statement stayed on the old FE"
-            eventually(lambda: old_fe_released(self.admin, self.config), 5)
-            assert (client.thread_id(), idle.thread_id()) == (thread_id, idle_thread_id)
-            client.ping(reconnect=False)
-            idle.ping(reconnect=False)
-        finally:
-            client.close()
-            idle.close()
-
-    def fe_auth_switch_with_running_query(self):
+    def switch_keeps_sessions_on_the_old_fe(self):
         client = connect(self.config["proxy"])
         idle = connect(self.config["proxy"])
         old = (self.config["backend"]["host"], self.config["backend"]["port"])
         new = (self.config["new_fe"]["host"], self.config["new_fe"]["port"])
         try:
+            client_fe, idle_fe = physical_id(client), physical_id(idle)
             query = "SELECT sleep(8), 'running-on-old-fe'"
             assert pool_used(self.admin, self.config, *old) == 2
             with ThreadPoolExecutor(max_workers=1) as pool:
@@ -158,85 +127,96 @@ class Suite:
                                        for row in sql(self.oracle, "SHOW PROCESSLIST")), 5)
                 switch_to_new_fe(self.admin, self.config)
                 assert not running.done(), "the query ended before the switch; nothing was tested"
-                # The idle client has sent nothing, and ProxySQL closes it now.
-                assert closed_by_proxysql(idle), "the idle client stayed on the drained FE"
-                assert not running.done(), "the running query ended with the idle client; nothing was tested"
                 result = running.result(timeout=60)
                 assert len(result) == 1 and result[0][1:] == (b"running-on-old-fe",), ("the running query lost its result", result)
-            # The client has the whole result, and then ProxySQL closes its connection.
-            assert closed_by_proxysql(client), "the client stayed on the drained FE after its request"
-            eventually(lambda: pool_used(self.admin, self.config, *old) == 0, 5)
+            # OFFLINE_SOFT only sends new logins elsewhere: both sessions go on with their FE connections.
+            assert not closed_by_proxysql(idle, timeout=3), "ProxySQL closed the idle client of the drained FE"
+            assert physical_id(client) == client_fe, "the client left its FE connection"
+            assert physical_id(idle) == idle_fe, "the idle client left its FE connection"
+            assert pool_used(self.admin, self.config, *old) == 2
             # A new connection lands on the ONLINE FE.
             newcomer = connect(self.config["proxy"])
             try:
                 assert sql(newcomer, "SELECT 'new-client'") == ((b"new-client",),)
                 assert pool_used(self.admin, self.config, *new) == 1
-                assert pool_used(self.admin, self.config, *old) == 0
             finally:
                 newcomer.close()
+            # The old FE is free when its clients leave by themselves.
+            client.close()
+            idle.close()
+            eventually(lambda: pool_used(self.admin, self.config, *old) == 0, 10)
         finally:
             for c in (client, idle):
                 if c.open:
                     c.close()
 
-    def fe_auth_transaction_ends_with_the_session(self):
+    def transaction_finishes_on_the_old_fe(self):
         sql(self.oracle, "CREATE DATABASE IF NOT EXISTS " + DATABASE)
         sql(self.oracle, "CREATE TABLE IF NOT EXISTS %s.t (id INT) PROPERTIES('replication_num'='1')" % DATABASE)
         sql(self.oracle, "TRUNCATE TABLE %s.t" % DATABASE)
         client = connect(self.config["proxy"])
         try:
+            fe = physical_id(client)
             sql(client, "USE " + DATABASE)
             sql(client, "BEGIN")
             sql(client, "INSERT INTO t VALUES (1)")
             switch_to_new_fe(self.admin, self.config)
-            # The session cannot move to another FE, so it ends and the FE rolls the transaction back.
-            assert closed_by_proxysql(client), "the session stayed on the drained FE"
-            eventually(lambda: pool_used(self.admin, self.config, self.config["backend"]["host"],
-                                         self.config["backend"]["port"]) == 0, 5)
-            assert sql(self.oracle, "SELECT COUNT(*) FROM %s.t" % DATABASE) == ((0,),)
+            # The session stays on its FE, so its transaction goes on there and commits.
+            sql(client, "INSERT INTO t VALUES (2)")
+            sql(client, "COMMIT")
+            assert physical_id(client) == fe, "the session left its FE connection"
+            assert sql(self.oracle, "SELECT COUNT(*) FROM %s.t" % DATABASE) == ((2,),)
         finally:
             if client.open:
                 client.close()
             sql(self.oracle, "DROP DATABASE IF EXISTS %s FORCE" % DATABASE)
 
-    def transaction_is_not_moved(self):
-        sql(self.oracle, "CREATE DATABASE IF NOT EXISTS " + DATABASE)
-        # The FE allows one DML statement per table in an explicit transaction, so each INSERT has its own table.
-        for table in ("t", "t2"):
-            sql(self.oracle, "CREATE TABLE IF NOT EXISTS %s.%s (id INT) PROPERTIES('replication_num'='1')" % (DATABASE, table))
-            sql(self.oracle, "TRUNCATE TABLE %s.%s" % (DATABASE, table))
-        client = connect(self.config["proxy"])
+    def kill_on_the_old_fe(self):
+        """After a switch, Ctrl+C of a session that stays on the old FE stops its query."""
+        old = (self.config["backend"]["host"], self.config["backend"]["port"])
+        new = (self.config["new_fe"]["host"], self.config["new_fe"]["port"])
+        victim = connect(self.config["proxy"])
+        killer = None
+        outcome = {}
+
+        def run():
+            try:
+                outcome["rows"] = sql(victim, HEAVY_QUERY)
+            except Exception as error:
+                outcome["error"] = error
+
+        thread = threading.Thread(target=run, daemon=True)
         try:
-            sql(client, "USE " + DATABASE)
-            old_id = physical_id(client)
-            sql(client, "BEGIN")
-            sql(client, "INSERT INTO t VALUES (1)")
+            thread.start()
+            eventually(lambda: any(row[5] == b"Query" and b"generate_series(1,100000000000)" in (row[9] or b"")
+                                   for row in sql(self.oracle, "SHOW PROCESSLIST")), 10)
             switch_to_new_fe(self.admin, self.config)
-            sql(client, "INSERT INTO t2 VALUES (2)")
-            assert physical_id(client) == old_id, "the session moved in the middle of a transaction"
-            assert pool_used(self.admin, self.config, self.config["backend"]["host"],
-                             self.config["backend"]["port"]) == 1
-            sql(client, "COMMIT")
-            eventually(lambda: sql(self.oracle, "SELECT id FROM %s.t" % DATABASE) == ((1,),) and
-                       sql(self.oracle, "SELECT id FROM %s.t2" % DATABASE) == ((2,),), 30)
-            eventually(lambda: old_fe_released(self.admin, self.config), 5)
-            assert physical_id(client) != old_id, "the session stayed on the old FE after COMMIT"
+            # The mysql client and Connector/J cancel over a new connection, which lands on the ONLINE FE.
+            killer = connect(self.config["proxy"])
+            assert pool_used(self.admin, self.config, *new) == 1
+            assert not sql(killer, "KILL QUERY %d" % victim.thread_id()), "the KILL answered with rows"
+            thread.join(30)
+            assert not thread.is_alive(), "the query on the old FE was not stopped"
+            assert "error" in outcome, outcome
+            eventually(lambda: not any(b"generate_series(1,100000000000)" in (row[9] or b"")
+                                       for row in sql(self.oracle, "SHOW PROCESSLIST")), 10)
+            eventually(lambda: pool_used(self.admin, self.config, *old) == 0, 10)
         finally:
-            client.close()
-            sql(self.oracle, "DROP DATABASE IF EXISTS %s FORCE" % DATABASE)
+            for connection in (killer, victim):
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
 
     def run(self):
         original = saved_servers(self.admin, self.config)
         try:
-            if self.config.get("fe_auth"):
-                cases = (("client keeps its FE connection between statements", self.connection_stays),
-                         ("running query finishes on the drained FE, then the client and the idle client are closed, and a new client lands on the ONLINE FE",
-                          self.fe_auth_switch_with_running_query),
-                         ("open transaction ends with its session when the FE is drained", self.fe_auth_transaction_ends_with_the_session))
-            else:
-                cases = (("client keeps its FE connection between statements", self.connection_stays),
-                         ("running query survives an FE switch and the idle sessions leave the old FE", self.switch_with_running_query),
-                         ("open transaction stays on the old FE until COMMIT", self.transaction_is_not_moved))
+            cases = (("client keeps its FE connection between statements", self.connection_stays),
+                     ("after a switch the running query finishes, both sessions stay on the old FE, and a new client lands on the ONLINE FE",
+                      self.switch_keeps_sessions_on_the_old_fe),
+                     ("an open transaction finishes and commits on the old FE after a switch", self.transaction_finishes_on_the_old_fe),
+                     ("after a switch, Ctrl+C of a session on the old FE stops its query", self.kill_on_the_old_fe))
             for name, function in cases:
                 only_backend(self.admin, self.config)
                 self.case(name, function)

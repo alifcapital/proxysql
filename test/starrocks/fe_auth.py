@@ -4,8 +4,7 @@
 ProxySQL holds no passwords in this mode. The FE authenticates every client, and the
 FE connection that took the login belongs to that client until it disconnects.
 The cases create their own FE users through config["backend"] (a user that can run
-CREATE USER) and drop them at the end. ProxySQL must be configured with
-`setup.py --fe-auth`.
+CREATE USER) and drop them at the end. ProxySQL must be configured with `setup.py`.
 
     python3 fe_auth.py CONFIG [--connector-jar mysql-connector-j.jar] [--mysql-cli mysql]
 """
@@ -25,8 +24,21 @@ import traceback
 
 import pymysql
 from pymysql.constants import COMMAND
+from pymysql.protocol import FieldDescriptorPacket
 
 from e2e import connect, eventually, sql
+
+
+def field_list(connection, table):
+    """Sends COM_FIELD_LIST and returns the name, type, length, flags and charset of each column."""
+    connection._execute_command(COMMAND.COM_FIELD_LIST, table + b"\0")
+    columns = []
+    while True:
+        packet = connection._read_packet()
+        if packet.is_eof_packet():
+            return columns
+        field = FieldDescriptorPacket(packet.get_all_data(), connection.encoding)
+        columns.append((field.name, field.type_code, field.length, field.flags, field.charsetnr))
 
 COM_RESET_CONNECTION = 0x1f
 # Runs on the compute nodes until it is stopped.
@@ -305,6 +317,166 @@ class Suite:
         finally:
             connection.close()
 
+    def command_error(self, function):
+        try:
+            function()
+        except pymysql.err.MySQLError as error:
+            return error.args
+        raise AssertionError("the command was accepted")
+
+    def use_catalog_and_database(self):
+        """USE `catalog`.`database` and COM_INIT_DB catalog.database run on the FE."""
+        connection = login(self.config, PASSWORD_USER, PASSWORD)
+        try:
+            first = fe_connection_id(connection)
+            sql(connection, "USE `default_catalog`.`information_schema`")
+            assert sql(connection, "SELECT DATABASE()") == ((b"information_schema",),)
+            connection.select_db("default_catalog.information_schema")
+            assert sql(connection, "SELECT DATABASE()") == ((b"information_schema",),)
+            assert fe_connection_id(connection) == first
+        finally:
+            connection.close()
+
+    def init_db_error_keeps_the_session(self):
+        """The FE error on COM_INIT_DB reaches the client, and the session goes on in its database."""
+        connection = login(self.config, PASSWORD_USER, PASSWORD)
+        direct = direct_login(self.config, PASSWORD_USER, PASSWORD)
+        try:
+            first = fe_connection_id(connection)
+            sql(connection, "USE information_schema")
+            through = self.command_error(lambda: connection.select_db("px_no_such_catalog`.x"))
+            oracle = self.command_error(lambda: direct.select_db("px_no_such_catalog`.x"))
+            assert through == oracle, ("the FE error must reach the client unchanged", through, oracle)
+            assert sql(connection, "SELECT DATABASE()") == ((b"information_schema",),)
+            assert fe_connection_id(connection) == first
+        finally:
+            connection.close()
+            direct.close()
+
+    def set_error_comes_with_the_set(self):
+        """A SET that the FE refuses gets the FE error itself, and the next query runs."""
+        connection = login(self.config, PASSWORD_USER, PASSWORD)
+        direct = direct_login(self.config, PASSWORD_USER, PASSWORD)
+        try:
+            through = self.command_error(lambda: sql(connection, "SET max_execution_time = 1000"))
+            oracle = self.command_error(lambda: sql(direct, "SET max_execution_time = 1000"))
+            assert through == oracle, ("the FE error must answer the SET", through, oracle)
+            assert sql(connection, "SELECT 1") == ((1,),)
+        finally:
+            connection.close()
+            direct.close()
+
+    def set_catalog_then_use(self):
+        """SET CATALOG resets the database on the FE, and USE of the same database sets it again."""
+        statements = ("USE information_schema", "SET CATALOG default_catalog", "SELECT DATABASE()",
+                      "USE information_schema", "SELECT DATABASE()")
+        results = []
+        for connect_to in (login, direct_login):
+            connection = connect_to(self.config, PASSWORD_USER, PASSWORD)
+            try:
+                results.append([sql(connection, statement) for statement in statements])
+            finally:
+                connection.close()
+        assert results[0] == results[1], ("the session must follow the FE", results)
+        assert results[0][-1] == ((b"information_schema",),), results
+
+    def answers_come_from_the_fe(self):
+        """Queries that ProxySQL could answer itself get the answer of the FE."""
+        connection = login(self.config, PASSWORD_USER, PASSWORD)
+        direct = direct_login(self.config, PASSWORD_USER, PASSWORD)
+        try:
+            for statement in ("SELECT @@version_comment LIMIT 1", "SELECT DATABASE()"):
+                assert sql(connection, statement) == sql(direct, statement), statement
+            assert b"@" in sql(connection, "select USER()")[0][0], "USER() of the FE has a host"
+        finally:
+            connection.close()
+            direct.close()
+
+    def fe_idle_seconds(self, identifier):
+        """Seconds since the FE connection started its last command, from the Time column of the FE process list."""
+        with self.oracle.cursor() as cursor:
+            cursor.execute("SHOW PROCESSLIST")
+            columns = [description[0] for description in cursor.description]
+            for row in cursor.fetchall():
+                if int(row[columns.index("Id")]) == identifier:
+                    return int(row[columns.index("Time")])
+        raise AssertionError("the FE connection %d is not in the process list" % identifier)
+
+    def ping_reaches_the_fe(self):
+        """COM_PING is answered by the FE: the FE starts a command for it, which resets the idle time of the connection."""
+        connection = login(self.config, PASSWORD_USER, PASSWORD)
+        try:
+            identifier = fe_connection_id(connection)
+            time.sleep(3)
+            assert self.fe_idle_seconds(identifier) >= 2, "the FE connection was not idle"
+            connection.ping(reconnect=False)
+            assert self.fe_idle_seconds(identifier) < 2, "the ping did not reach the FE"
+        finally:
+            connection.close()
+
+    def field_list_comes_from_the_fe(self):
+        """COM_FIELD_LIST lists the columns in the database of the session, as on a direct FE connection."""
+        database = "px_fe_auth_fl"
+        sql(self.oracle, "CREATE DATABASE IF NOT EXISTS %s" % database)
+        try:
+            sql(self.oracle, "CREATE TABLE IF NOT EXISTS %s.t (a INT, b VARCHAR(8) DEFAULT 'x') DUPLICATE KEY(a) "
+                "DISTRIBUTED BY HASH(a) PROPERTIES('replication_num'='1')" % database)
+            results = []
+            for connect_to in (login, direct_login):
+                connection = connect_to(self.config, self.config["proxy"]["user"], self.config["proxy"]["password"],
+                                        database=database)
+                try:
+                    columns = field_list(connection, b"t")
+                    error = self.command_error(lambda: field_list(connection, b"px_no_such_table"))
+                    assert sql(connection, "SELECT 1") == ((1,),), "the session goes on after the error"
+                    results.append((columns, error))
+                finally:
+                    connection.close()
+            assert results[0] == results[1], ("COM_FIELD_LIST must answer as the FE", results)
+            assert [column[0] for column in results[0][0]] == ["a", "b"], results
+        finally:
+            sql(self.oracle, "DROP DATABASE IF EXISTS %s FORCE" % database)
+
+    def prepared_statements_follow_the_database(self):
+        """A statement prepared twice in two databases runs as on a direct FE connection."""
+        import mysql.connector
+        databases = ("px_fe_auth_ps1", "px_fe_auth_ps2")
+        for database in databases:
+            sql(self.oracle, "CREATE DATABASE IF NOT EXISTS %s" % database)
+        try:
+            sql(self.oracle, "CREATE TABLE IF NOT EXISTS %s.t (a INT) DUPLICATE KEY(a) DISTRIBUTED BY HASH(a) "
+                "PROPERTIES('replication_num'='1')" % databases[0])
+            sql(self.oracle, "CREATE TABLE IF NOT EXISTS %s.t (a INT, b VARCHAR(8)) DUPLICATE KEY(a) DISTRIBUTED BY HASH(a) "
+                "PROPERTIES('replication_num'='1')" % databases[1])
+            sql(self.oracle, "INSERT INTO %s.t VALUES (1)" % databases[0])
+            sql(self.oracle, "INSERT INTO %s.t VALUES (2, 'two')" % databases[1])
+            results = []
+            for endpoint in (self.config["proxy"], self.config["backend"]):
+                options = dict(endpoint)
+                options.update(user=self.config["proxy"]["user"], password=self.config["proxy"]["password"])
+                connection = mysql.connector.connect(**options, use_pure=True, ssl_disabled=True, autocommit=True)
+                try:
+                    run = []
+                    first = connection.cursor(prepared=True)
+                    connection.cmd_query("USE %s" % databases[0])
+                    first.execute("SELECT * FROM t")
+                    run.append(first.fetchall())
+                    connection.cmd_query("USE %s" % databases[1])
+                    second = connection.cursor(prepared=True)
+                    second.execute("SELECT * FROM t")
+                    run.append(second.fetchall())
+                    first.execute("SELECT * FROM t")
+                    run.append(first.fetchall())
+                    first.close()
+                    second.close()
+                    results.append(run)
+                finally:
+                    connection.close()
+            assert results[0] == results[1], ("prepared statements must run as on the FE", results)
+        finally:
+            for database in databases:
+                sql(self.oracle, "DROP DATABASE IF EXISTS %s FORCE" % database)
+
     def disconnects_during_login(self):
         """A client that leaves before the FE login ends does not leave an FE connection behind."""
         host, port = self.config["proxy"]["host"], self.config["proxy"]["port"]
@@ -524,45 +696,56 @@ class Suite:
             connection.close()
             direct.close()
 
+    def fe_of(self, connection):
+        """Host and port of the FE that ProxySQL connected for this client."""
+        rows = sql(self.admin, "SELECT srv_host, srv_port FROM stats_mysql_processlist WHERE SessionID=%s",
+                   (connection.thread_id(),))
+        return tuple(rows[0]) if rows else None
+
+    def login_on_other_fe(self, user, password, fe):
+        """A client of the user whose FE connection is not on the FE given."""
+        for _ in range(40):
+            connection = login(self.config, user, password)
+            if self.fe_of(connection) != fe:
+                return connection
+            connection.close()
+        raise AssertionError("no login landed on the other FE")
+
     def kill_across_two_fes(self):
-        """KILL by connection id is local to an FE. With sessions on two servers, the client learns it."""
+        """KILL by connection id is local to an FE. ProxySQL ends a session of the same user on another FE itself."""
         rows = sql(self.admin, "SELECT hostname,port,weight FROM mysql_servers WHERE hostgroup_id=%s", (self.config["hostgroup"],))
         assert len(rows) == 2, "the hostgroup needs two servers (setup.py adds the second one)"
         sql(self.admin, "UPDATE mysql_servers SET weight=1000000 WHERE hostgroup_id=%s", (self.config["hostgroup"],))
         sql(self.admin, "LOAD MYSQL SERVERS TO RUNTIME")
-        killed, refused = 0, []
+        victim, fe_id, outcome = self.start_heavy_query()
+        killer = other = None
         try:
-            for _ in range(40):
-                if killed and refused:
-                    break
-                victim, fe_id, outcome = self.start_heavy_query()
-                try:
-                    killer = login(self.config, PASSWORD_USER, PASSWORD)
-                    try:
-                        try:
-                            sql(killer, "KILL QUERY %d" % victim.thread_id())
-                        except pymysql.err.Error as error:
-                            refused.append(error.args)
-                            continue
-                    finally:
-                        killer.close()
-                    killed += 1
-                    eventually(lambda: fe_id not in heavy_queries(self.oracle), 10)
-                finally:
-                    # The owner stops its own query (it is on the FE of the victim).
-                    try:
-                        sql(self.oracle, "KILL QUERY %d" % fe_id)
-                    except pymysql.err.Error:
-                        pass
-                    victim.close()
+            victim_fe = self.fe_of(victim)
+            other = self.login_on_other_fe(EMPTY_USER, "", victim_fe)
+            killer = self.login_on_other_fe(PASSWORD_USER, PASSWORD, victim_fe)
+            # ProxySQL cannot check the privilege of the FE to kill the session of another user.
+            refused = self.command_error(lambda: sql(other, "KILL QUERY %d" % victim.thread_id()))
+            assert refused[0] == 1095 and "ProxySQL: connection" in refused[1], refused
+            assert fe_id in heavy_queries(self.oracle), "the query of the victim stopped after a refused KILL"
+            # The same user stops its query from the other FE: ProxySQL ends the session of the victim.
+            assert not sql(killer, "KILL QUERY %d" % victim.thread_id()), "the KILL answered with rows"
+            outcome["thread"].join(30)
+            assert not outcome["thread"].is_alive(), "the query was not interrupted"
+            assert "error" in outcome, outcome
+            eventually(lambda: fe_id not in heavy_queries(self.oracle), 10)
+            eventually(lambda: fe_id not in cn_queries(self.oracle), 10)
+            assert sql(killer, "SELECT 1") == ((1,),), "the session of the killer goes on"
         finally:
+            for connection in (killer, other, victim):
+                if connection is not None:
+                    try:
+                        connection.close()
+                    except Exception:
+                        pass
             for host, port, weight in rows:
                 sql(self.admin, "UPDATE mysql_servers SET weight=%s WHERE hostgroup_id=%s AND hostname=%s AND port=%s",
                     (int(weight), self.config["hostgroup"], host.decode() if isinstance(host, bytes) else host, int(port)))
             sql(self.admin, "LOAD MYSQL SERVERS TO RUNTIME")
-        assert killed, "no KILL ran on the FE of the victim"
-        assert refused, "no pair of sessions was on different servers"
-        assert all(args[0] == 1094 and "ProxySQL: connection" in args[1] for args in refused), refused
 
     def jdbc_cancel_and_timeout(self):
         if not self.jar:
@@ -665,6 +848,14 @@ class Suite:
                 ("Connector/J login in every variant", self.jdbc_login),
                 ("a client with another authentication plugin switches to mysql_native_password", self.cli_auth_switch),
                 ("session state stays on the FE connection of the client", self.session_state_stays),
+                ("USE and COM_INIT_DB with a catalog run on the FE", self.use_catalog_and_database),
+                ("the FE error on COM_INIT_DB reaches the client and the session goes on", self.init_db_error_keeps_the_session),
+                ("a SET that the FE refuses gets the FE error itself", self.set_error_comes_with_the_set),
+                ("SET CATALOG and USE follow the FE", self.set_catalog_then_use),
+                ("queries that ProxySQL could answer get the answer of the FE", self.answers_come_from_the_fe),
+                ("COM_PING is answered by the FE", self.ping_reaches_the_fe),
+                ("COM_FIELD_LIST is answered by the FE", self.field_list_comes_from_the_fe),
+                ("prepared statements in two databases run as on the FE", self.prepared_statements_follow_the_database),
                 ("clients that leave during the login leave no FE connection", self.disconnects_during_login),
                 ("every client holds its own FE connection and nothing is pooled", self.one_fe_connection_per_client),
                 ("no FE connection serves two clients", self.no_reuse_over_many_logins),
@@ -675,7 +866,7 @@ class Suite:
                 ("KILL id from a second connection ends the first connection", self.kill_connection_from_second_connection),
                 ("KILL of a session of another user gets the error of the FE", self.kill_of_another_user_gets_the_fe_error),
                 ("KILL of an unknown id gets the error of the FE", self.kill_of_unknown_id),
-                ("KILL of a session on another FE gets a clear error", self.kill_across_two_fes),
+                ("KILL of a session on another FE ends it for the same user and is refused for another user", self.kill_across_two_fes),
                 ("Connector/J Statement.cancel() and setQueryTimeout() stop the query", self.jdbc_cancel_and_timeout),
                 ("a client socket closed in the middle of a query stops the query on the FE", self.client_socket_closed_mid_query),
                 ("clients that leave in the middle of queries leave no running query", self.client_killed_mid_query_stops_cn_work),

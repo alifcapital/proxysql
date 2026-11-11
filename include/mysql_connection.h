@@ -26,7 +26,6 @@
 #define STATUS_MYSQL_CONNECTION_NO_MULTIPLEX_HG      0x00000400
 #define STATUS_MYSQL_CONNECTION_HAS_SAVEPOINT        0x00000800
 #define STATUS_MYSQL_CONNECTION_HAS_WARNINGS         0x00001000
-#define STATUS_MYSQL_CONNECTION_STARROCKS_TRANSACTION 0x00002000
 
 #include "Servers_SslParams.h"
 
@@ -227,6 +226,9 @@ class MySQL_Connection {
 	 * @param response_len 0 or 20.
 	 */
 	void relay_set_client(const char *user, const char *db, const unsigned char *response, unsigned int response_len);
+	/// Table of the COM_FIELD_LIST that async_list_fields() sends for the client, and the columns that the FE answered.
+	std::string list_fields_table;
+	MYSQL_RES *list_fields_result;
 	void compute_unknown_transaction_status();
 	char gtid_uuid[128];
 
@@ -260,6 +262,8 @@ class MySQL_Connection {
 #endif // PROXYSQL_USE_RESULT
 	void initdb_start();
 	void initdb_cont(short event);
+	void list_fields_start();
+	void list_fields_cont(short event);
 	void set_option_start();
 	void set_option_cont(short event);
 	void set_query(char *stmt, unsigned long length);
@@ -269,6 +273,8 @@ class MySQL_Connection {
 	int async_connect(short event);
 	int async_change_user(short event);
 	int async_select_db(short event);
+	/// Sends COM_FIELD_LIST for list_fields_table. Returns 0 when list_fields_result has the columns, -1 on an error, 1 while it runs.
+	int async_list_fields(short event);
 	int async_set_autocommit(short event, bool);
 	int async_set_names(short event, unsigned int nr);
 	int async_send_simple_command(short event, char *stmt, unsigned long length, bool redact_statement=false); // no result set expected
@@ -312,11 +318,7 @@ class MySQL_Connection {
 	bool IsServerOffline();
 	bool IsAutoCommit();
 	bool AutocommitFalse_AndSavepoint();
-	/**
-	 * @param check_hostgroup_setting When false, the hostgroup attribute 'multiplex=0' is not counted as a reason
-	 *  to disable multiplexing, so the result tells whether the connection state alone pins the session to it.
-	 */
-	bool MultiplexDisabled(bool check_delay_token = true, bool check_hostgroup_setting = true);
+	bool MultiplexDisabled(bool check_delay_token = true);
 	bool IsKeepMultiplexEnabledVariables(char *query_digest_text);
 	void ProcessQueryAndSetStatusFlags(char *query_digest_text, bool user_variable_usage_is_safe);
 	void optimize();

@@ -34,8 +34,9 @@ The memory threshold is a buffering trigger, not a strict process RSS limit.
 Write staging, readback, protocol/TLS buffers and an individual oversized row
 can require additional memory. Query-cache entries also have their own budget;
 oversized cache hits bypass copying into the response and fetch from the backend.
-After the backend finishes and its session is eligible for multiplexing, it can
-return to the pool while the client continues reading the spooled response.
+The FE query is complete as soon as ProxySQL has fetched the result, while the
+client still reads the spooled response. The client keeps its FE connection while
+it reads, so `ConnUsed` stays above 0.
 Backend fetching is throttled when the bounded disk-write queue is full.
 
 Spill applies to regular MySQL frontend sessions, including TLS, compressed
@@ -43,66 +44,14 @@ connections and prepared results. Admin, mirror and fast-forward sessions do not
 use this path. Frontend compression is independent of FE compression; Connector/J
 can use `useCompression=true` against ProxySQL with an uncompressed FE connection.
 
-## Enable StarRocks behavior
-
-Enable StarRocks behavior explicitly for each backend hostgroup:
-
-```sql
-INSERT OR IGNORE INTO mysql_hostgroup_attributes(hostgroup_id) VALUES(10);
-UPDATE mysql_hostgroup_attributes
-SET hostgroup_settings=json_set(CASE WHEN hostgroup_settings='' THEN '{}'
-                                    ELSE hostgroup_settings END,
-                                '$.backend_type', 'starrocks')
-WHERE hostgroup_id=10;
-LOAD MYSQL SERVERS TO RUNTIME;
-```
-
-This capability leaves the default MySQL behavior unchanged.
-
-## Keep a client on one FE connection
-
-With `mysql-multiplexing=true` (the default) every statement of a client may run
-on another pooled FE connection. State that lives in the FE connection then
-follows the client only by luck: temporary tables, session variables and SQL
-`PREPARE` statements are lost. Set the hostgroup attribute `multiplex` to 0 for
-every StarRocks hostgroup, so that a client keeps its FE connection until it
-disconnects:
-
-```sql
-INSERT OR IGNORE INTO mysql_hostgroup_attributes(hostgroup_id) VALUES(10);
-UPDATE mysql_hostgroup_attributes SET multiplex=0 WHERE hostgroup_id=10;
-LOAD MYSQL SERVERS TO RUNTIME;
-```
-
-The attribute applies to the hostgroup only, so other hostgroups keep the
-global `mysql-multiplexing`. We do not use `mysql-multiplexing=false` because it
-would also stop multiplexing in non-StarRocks hostgroups. Set the attribute
-when you create the hostgroup, before clients connect.
-
-Every client session holds one FE connection, so `max_connections` of each
-`mysql_servers` row must be at least the number of clients that can be on that
-FE at the same time. A client that cannot get a connection waits for
-`mysql-connect_timeout_server_max` and then receives error 9001.
-
-A client that reads a buffered response slowly (see the first section) keeps its
-FE connection while it reads, so `ConnUsed` stays above 0. The FE query is
-complete as soon as ProxySQL has fetched the result.
-
-StarRocks does not report an open explicit transaction in its OK packets, so
-ProxySQL follows `BEGIN`, `START TRANSACTION`, `COMMIT` and `ROLLBACK` itself
-and keeps the connection pinned between them. A `COMMIT` or `ROLLBACK` that
-shares a packet with other statements does not release the connection; the next
-single-statement `COMMIT` or `ROLLBACK` does.
-
 ## Let the StarRocks FE authenticate the clients
 
-With the default setup ProxySQL holds the user names and passwords in
-`mysql_users` and logs in to the FE with them. With the variable
-`mysql-starrocks_auth_hostgroup` ProxySQL holds no passwords at all: the FE
-authenticates every client, with its own users, passwords and error messages.
+With the variable `mysql-starrocks_auth_hostgroup` ProxySQL holds no passwords at
+all: the FE authenticates every client, with its own users, passwords and error
+messages, and every client keeps one FE connection for its whole session.
 
 ```sql
--- hostgroup 10 holds the FEs, with backend_type=starrocks and multiplex=0 as above
+-- hostgroup 10 holds the FEs
 SET mysql-starrocks_auth_hostgroup=10;
 LOAD MYSQL VARIABLES TO RUNTIME;
 SAVE MYSQL VARIABLES TO DISK;
@@ -149,6 +98,21 @@ What to know when you set it up:
 * Query rules must not send these clients to another hostgroup. ProxySQL has no
   password for a connection there, so the client gets an error and its connection
   ends.
+* The FE keeps the whole session state of the client, and ProxySQL keeps none. ProxySQL
+  sends every command of the client to the FE and gives the client the answer of the
+  FE: `USE`, `COM_INIT_DB` (an error of the FE leaves the session as it was), `SET` of
+  any variable, `COMMIT`, `ROLLBACK`, `SHOW WARNINGS`, `COM_PING`, `COM_FIELD_LIST`, `SELECT VERSION()`,
+  `LAST_INSERT_ID()` and the other queries that ProxySQL answers itself for its own users.
+  It sends nothing of its own before a request, and the query cache is not used. A client
+  without a database at login has no database on the FE, as on a direct connection.
+* Each prepare of a client is a statement of its own on the FE, and `COM_STMT_CLOSE`
+  closes it there. ProxySQL does not know the catalog and the database of the FE, so it
+  does not share prepared statements between clients or between prepares of one client.
+* ProxySQL still answers a few commands itself: `SELECT CONNECTION_ID()` and the
+  greeting carry the connection id of ProxySQL (see `KILL` below), `PROXYSQL INTERNAL`
+  commands, `SHOW STATUS LIKE 'Ssl_version'` (about the TLS between the client and
+  ProxySQL), the refusal of `LOAD DATA LOCAL INFILE`, and the commands that the FE does
+  not support: `COM_SET_OPTION`, `COM_STATISTICS`, `COM_REFRESH` and `COM_PROCESS_KILL`.
 
 Stopping a query works as with a plain MySQL server. A client sends `KILL QUERY id`
 or `KILL id` over a new connection (the `mysql` client does it on Ctrl+C, and
@@ -161,9 +125,19 @@ the FE answers with its own OK or error. The FE lets a user kill its own session
 and requires `OPERATE` for the sessions of other users. The connection id is kept
 by one ProxySQL, so the `KILL` must reach the ProxySQL that holds the session.
 The FE kills only its own connections. If the new connection is on another FE than
-the session it wants to kill, the client gets the error 1094 that names both FEs.
+the session it wants to kill (for example, while the FE of that session is drained),
+ProxySQL ends that session itself when it belongs to the same user: it closes the
+client connection and the FE connection of that session, and the FE cancels the
+query. `KILL QUERY` then ends the whole session, because ProxySQL has no other way to
+stop the query on that FE. ProxySQL cannot check the privilege of the FE to kill the
+session of another user on another FE, so that `KILL` gets the error 1095.
 `KILL QUERY 'query_id'` with a query id string goes to the FE as it is, and the FE
 forwards it to the FE that owns the query.
+
+A query that runs longer than its timeout in ProxySQL (`mysql-default_query_timeout`, the
+`default_query_timeout` of the hostgroup or the `timeout` of a query rule) ends the whole
+session: ProxySQL closes the client connection and the FE connection, and the FE cancels the
+query. ProxySQL has no password to cancel the query over another FE connection.
 
 When a client disconnects while its query runs, ProxySQL closes the FE connection,
 and the FE cancels the query (`mysql_service_kill_after_disconnect`, true by default). The
@@ -179,59 +153,32 @@ What is not supported in this version:
   drop the FE connection of the client, and ProxySQL cannot log in again. The client
   has to disconnect and connect again as the other user.
 * Per user limits (`max_connections` of `mysql_users`), user attributes, default
-  schemas of `mysql_users` and `fast_forward`. A client without a database gets
-  `mysql-default_schema`.
+  schemas of `mysql_users` and `fast_forward`.
 * TLS from ProxySQL to the FE (`use_ssl` of the server row) is not tested.
 
 ## Switch a frontend
 
-This section describes the setup with ProxySQL users. The next section describes
-the FE authentication, where a session does not move.
-
-Use this procedure to replace an FE (for example, to promote a follower):
-
-1. Add the new FE to the hostgroup as `ONLINE` and run
-   `LOAD MYSQL SERVERS TO RUNTIME`.
-2. Set the old FE to `OFFLINE_SOFT` and run `LOAD MYSQL SERVERS TO RUNTIME`.
-   The two steps may also be one `LOAD`.
-3. Wait until `ConnUsed` of the old FE in `stats_mysql_connection_pool` is 0,
-   then stop it.
-
-A query that is running on the old FE finishes there and the client receives the
-whole result. When a request ends, ProxySQL releases the session's connection to
-a server that is not `ONLINE`, and the next statement of the same client
-connection runs on an `ONLINE` FE. ProxySQL does not copy the session
-variables, catalog or database of the client to the new FE, so the session
-starts there as a new login.
-
-A client that is idle when the old FE is set to `OFFLINE_SOFT` keeps its
-connection to that FE until it sends its next command, so an idle client that
-never sends anything keeps `ConnUsed` above 0. Stop the old FE only when
-`ConnUsed` is 0, or accept that such clients lose the connection when it stops.
-
-A session stays on the old FE while its connection holds state that cannot move:
-an open transaction (until `COMMIT` or `ROLLBACK`), a temporary table, a user
-variable, an SQL `PREPARE` or a lock. Such a session leaves the old FE with the
-first request that ends without that state.
-
-### Switch a frontend when the FE authenticates the clients
-
-A client cannot move to another FE here: ProxySQL has no password to log in again,
-and the new FE would not know the session. So an FE is drained by closing its
-clients, and the clients log in again on an `ONLINE` FE.
+We want to replace an FE without cutting its clients. A client cannot move to another
+FE: ProxySQL has no password to log in again, and the new FE would not know the
+session. So the old FE keeps its sessions, and only new logins go to the new FE.
 
 1. Add the new FE to the hostgroup as `ONLINE` and run
    `LOAD MYSQL SERVERS TO RUNTIME`.
 2. Set the old FE to `OFFLINE_SOFT` and run `LOAD MYSQL SERVERS TO RUNTIME`. New
    clients log in on an `ONLINE` FE from now on.
-3. A client whose request runs on the old FE gets the whole result. Then ProxySQL
-   closes its connection. A client that is idle is closed within about a second. An
-   open transaction ends with the connection, and the FE rolls it back. A request
-   that arrives after the switch is not run.
-4. Wait until `ConnUsed` of the old FE in `stats_mysql_connection_pool` is 0, then
-   stop it.
+3. Every session of the old FE goes on there as before: a running request finishes, an
+   open transaction can commit, and the next statements run on the same FE connection.
+4. Wait until `ConnUsed` of the old FE in `stats_mysql_connection_pool` is 0, that is,
+   until its clients have disconnected by themselves, then stop it. Clients that keep
+   their connections open (connection pools) hold the old FE until they close them;
+   stopping the FE earlier cuts them.
 
-The same happens when the FE connection of a client ends for another reason (the FE
-restarts, or the connection is killed on the FE): ProxySQL closes the client
-connection. It never connects to an FE for a client. The client has to connect
-again, so clients and drivers must reconnect, as they must for any lost connection.
+While a session is on the old FE, a `KILL` that its client sends over a new connection
+lands on the new FE. ProxySQL then ends that session itself (see `KILL` above), so
+Ctrl+C stops the query, and the session ends with it.
+
+ProxySQL closes the client connection when the FE connection of the client ends (the
+FE stops or restarts, or the connection is killed on the FE), or when the FE is set to
+`OFFLINE_HARD`. It never connects to an FE for a client that is logged in. The client has
+to connect again, so clients and drivers must reconnect, as they must for any lost
+connection.

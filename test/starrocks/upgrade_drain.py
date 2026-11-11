@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
 """Verify an in-flight query survives FE drain and new clients use the other FE.
 
-With ProxySQL authentication the existing client continues on the other FE. When
-config["fe_auth"] is true the FE authenticated the client, so ProxySQL closes the
-client connection after the response of the running query instead.
+The FE authenticated the client, so the session cannot move: it stays on the
+drained FE, gets the response of the running query and runs its next statement there.
 """
 import argparse
 from concurrent.futures import ThreadPoolExecutor
@@ -41,14 +40,8 @@ def run(config):
             assert sql(newcomer, "SELECT 'new-client-on-new-fe'") == ((b"new-client-on-new-fe",),)
             assert_migrated(admin, config, before)
             assert running.result(timeout=30) == expected, "old FE response was lost or changed during drain"
-            if config.get("fe_auth"):
-                client._sock.settimeout(20)
-                assert client._sock.recv(1) == b"", "the client stayed on the drained FE"
-            else:
-                before = query_counts(admin, config)
-                assert sql(client, "SELECT 'existing-client-on-new-fe'") == ((b"existing-client-on-new-fe",),)
-                assert_migrated(admin, config, before)
-        print("# old query completed; new and existing frontend connections used the other FE", flush=True)
+            assert sql(client, "SELECT 'existing-client-on-old-fe'") == ((b"existing-client-on-old-fe",),)
+        print("# old query completed; the client stayed on the old FE and a new client used the other FE", flush=True)
     finally:
         if newcomer is not None:
             newcomer.close()
