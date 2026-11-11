@@ -8706,7 +8706,7 @@ __starrocks_proxysql_own_queries:
 
 	// handle case, about SELECT_MYSQL_VERSION or SELECT VERSION()
 	// The FE answers it for a client whom the FE authenticated, see starrocks_auth_session.
-	if (!starrocks_auth_session && (pkt->size==SELECT_MYSQL_VERSION_LEN+5 && *((char *)(pkt->ptr)+4)==(char)0x03 && strncasecmp((char *)SELECT_MYSQL_VERSION,(char *)pkt->ptr+5,pkt->size-5)==0) ||
+	if (!starrocks_auth_session && ((pkt->size==SELECT_MYSQL_VERSION_LEN+5 && *((char *)(pkt->ptr)+4)==(char)0x03 && strncasecmp((char *)SELECT_MYSQL_VERSION,(char *)pkt->ptr+5,pkt->size-5)==0) ||
 		(pkt->size==SELECT_MYSQL_VERSION_FUNC_LEN+5 && *((char *)(pkt->ptr)+4)==(char)0x03 && strncasecmp((char *)SELECT_MYSQL_VERSION_FUNC,(char *)pkt->ptr+5,pkt->size-5)==0))) {
 		char *version_to_return = NULL;
 		int mode = mysql_thread___select_version_forwarding;  // SelectVersionForwardingMode enum values
