@@ -5263,7 +5263,8 @@ __get_pkts_from_client:
 							}
 						}
 						client_myds->com_field_list=false; // default
-						if (c == _MYSQL_COM_FIELD_LIST) {
+						// The FE answers COM_FIELD_LIST of a client whom it authenticated, see starrocks_auth_session.
+						if (c == _MYSQL_COM_FIELD_LIST && !starrocks_auth_session) {
 							if (session_type == PROXYSQL_SESSION_MYSQL) {
 								MySQL_Protocol *myprot=&client_myds->myprot;
 								bool rcp = myprot->generate_COM_QUERY_from_COM_FIELD_LIST(&pkt);
@@ -10334,8 +10335,10 @@ bool MySQL_Session::handler_again___status_STARROCKS_FIELD_LIST(int *_rc) {
 		uint8_t sid = 1;
 		for (unsigned int i = 0; i < count; i++) {
 			MYSQL_FIELD *f = &fields[i];
+			// The client library adds NUM_FLAG to numeric columns, and servers do not send it, so the client gets
+			// the flags of the FE without it.
 			client_myds->myprot.generate_pkt_field(true, NULL, NULL, sid++, f->db, f->table, f->org_table, f->name,
-				f->org_name, f->charsetnr, f->length, f->type, f->flags, f->decimals, true,
+				f->org_name, f->charsetnr, f->length, f->type, f->flags & ~NUM_FLAG, f->decimals, true,
 				f->def ? f->def_length : 0, f->def ? f->def : (char *)"");
 		}
 		const uint16_t server_status = myconn->mysql->server_status;
