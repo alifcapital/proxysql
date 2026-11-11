@@ -134,6 +134,11 @@ session of another user on another FE, so that `KILL` gets the error 1095.
 `KILL QUERY 'query_id'` with a query id string goes to the FE as it is, and the FE
 forwards it to the FE that owns the query.
 
+A query that runs longer than its timeout in ProxySQL (`mysql-default_query_timeout`, the
+`default_query_timeout` of the hostgroup or the `timeout` of a query rule) ends the whole
+session: ProxySQL closes the client connection and the FE connection, and the FE cancels the
+query. ProxySQL has no password to cancel the query over another FE connection.
+
 When a client disconnects while its query runs, ProxySQL closes the FE connection,
 and the FE cancels the query (`mysql_service_kill_after_disconnect`, true by default). The
 FE can miss the cancel of a query that started less than about a second before, whether the

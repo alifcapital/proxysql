@@ -680,6 +680,8 @@ class MySQL_Session: public Base_Session<MySQL_Session, MySQL_Data_Stream, MySQL
 	 *  wait for the next request, instead of going on with a query or ending a ping session.
 	 */
 	bool starrocks_client_init_db;
+	/// The database name of the COM_INIT_DB that the client sent, as it is.
+	std::string starrocks_init_db_name;
 	bool starrocks_client_ping;
 	/**
 	 * @brief Starts to run a command of the client on the FE connection of the session, in the step 'st'.

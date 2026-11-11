@@ -2331,8 +2331,14 @@ int MySQL_Session::handler_again___status_RESETTING_CONNECTION() {
 void MySQL_Session::handler_again___new_thread_to_kill_connection() {
 	MySQL_Data_Stream *myds=mybe->server_myds;
 	// The kill thread logs in with the password of the user. A StarRocks relay connection has none, so for it the
-	// FE cancels the query when the session closes its connection.
-	if (myds->myconn && myds->myconn->mysql && !myds->myconn->starrocks_relay) {
+	// session ends instead: it closes the FE connection, and the FE cancels the query.
+	if (myds->myconn && myds->myconn->starrocks_relay) {
+		myds->wait_until=0;
+		myds->killed_at=thread->curtime;
+		killed=true;
+		return;
+	}
+	if (myds->myconn && myds->myconn->mysql) {
 		if (myds->killed_at==0) {
 			myds->wait_until=0;
 			myds->killed_at=thread->curtime;
@@ -3564,6 +3570,15 @@ bool MySQL_Session::handler_again___status_CHANGING_SCHEMA(int *_rc) {
 				client_myds->myprot.generate_pkt_ERR(true,NULL,NULL,1,myerr,sqlstate,mysql_error(myconn->mysql));
 				client_myds->DSS = STATE_SLEEP;
 				status = WAITING_CLIENT_DATA;
+				return false;
+			}
+			if (starrocks_client_init_db) {
+				// The FE did not answer: the connection broke or the FE went offline. The session cannot get another
+				// FE connection, so it ends.
+				detected_broken_connection(__FILE__ , __LINE__ , __func__ , "during INIT_DB of a client", myconn, myerr, mysql_error(myconn->mysql));
+				myds->destroy_MySQL_Connection_From_Pool(false);
+				myds->fd=0;
+				*_rc=-1;
 				return false;
 			}
 			if (myerr >= 2000 || myerr == 0) {
@@ -6536,7 +6551,8 @@ handler_again:
 							// LCOV_EXCL_STOP
 					}
 
-					if (mysql_thread___log_mysql_warnings_enabled) {
+					// The FE keeps the warnings of the client: a SHOW WARNINGS of ProxySQL would replace them.
+					if (mysql_thread___log_mysql_warnings_enabled && !starrocks_auth_session) {
 						auto warn_no = mysql_warning_count(myconn->mysql);
 						if (warn_no > 0) {
 							// Backup actual digest causing the warning before it's destroyed by finishing the request
@@ -7294,9 +7310,10 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 	client_myds->setDSS_STATE_QUERY_SENT_NET();
 	if (starrocks_auth_session) {
 		// The client pings to know that its FE answers, so the FE answers the ping, see starrocks_auth_session.
+		// The client waits for the FE as long as it wants, so ProxySQL sets no deadline of its own.
 		if (starrocks_forward_to_fe(PINGING_SERVER)) {
 			starrocks_client_ping = true;
-			mybe->server_myds->wait_until = thread->curtime + mysql_thread___ping_timeout_server * 1000;
+			mybe->server_myds->wait_until = 0;
 		}
 		return;
 	}
@@ -7364,6 +7381,9 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 		// The FE changes the catalog and the database and answers, see starrocks_auth_session.
 		// CHANGING_SCHEMA sends the schema name of the client connection, so we put the name there.
 		__sync_fetch_and_add(&MyHGM->status.frontend_init_db, 1);
+		// The FE gets the name exactly as the client sent it, also an empty one, which set_schemaname() would
+		// replace with mysql-default_schema.
+		starrocks_init_db_name.assign((char *)pkt->ptr+sizeof(mysql_hdr)+1,pkt->size-sizeof(mysql_hdr)-1);
 		client_myds->myconn->userinfo->set_schemaname((char *)pkt->ptr+sizeof(mysql_hdr)+1,pkt->size-sizeof(mysql_hdr)-1);
 		l_free(pkt->size,pkt->ptr);
 		client_myds->setDSS_STATE_QUERY_SENT_NET();
@@ -9303,7 +9323,8 @@ void MySQL_Session::MySQL_Result_to_MySQL_wire(MYSQL *mysql, MySQL_ResultSet *My
 		bool com_field_list=client_myds->com_field_list;
 		assert(resultset_completed); // the resultset should always be completed if MySQL_Result_to_MySQL_wire is called
 		if (transfer_started==false) { // we have all the resultset when MySQL_Result_to_MySQL_wire was called
-			if (qpo && qpo->cache_ttl>0 && com_field_list==false) { // the resultset should be cached
+			// ProxySQL does not answer for the FE of a client whom the FE authenticated, so it caches nothing for it.
+			if (qpo && qpo->cache_ttl>0 && com_field_list==false && !starrocks_auth_session) { // the resultset should be cached
 				if (mysql_errno(mysql)==0 &&
 					(mysql_warning_count(mysql)==0 ||
 					 mysql_thread___query_cache_handle_warnings==1)) { // no errors

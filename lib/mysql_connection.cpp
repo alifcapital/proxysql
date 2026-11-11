@@ -1219,7 +1219,9 @@ void MySQL_Connection::ping_cont(short event) {
 void MySQL_Connection::initdb_start() {
 	PROXY_TRACE();
 	MySQL_Connection_userinfo *client_ui=myds->sess->client_myds->myconn->userinfo;
-	async_exit_status = mysql_select_db_start(&interr,mysql,client_ui->schemaname);
+	// A COM_INIT_DB of a client whom the StarRocks FE authenticated goes to the FE with its own name.
+	const char *db = myds->sess->starrocks_client_init_db ? myds->sess->starrocks_init_db_name.c_str() : client_ui->schemaname;
+	async_exit_status = mysql_select_db_start(&interr,mysql,db);
 }
 
 void MySQL_Connection::initdb_cont(short event) {
@@ -1555,7 +1557,8 @@ handler_again:
 				ping_cont(event);
 			}
 			if (async_exit_status) {
-				if (myds->sess->thread->curtime >= myds->wait_until) {
+				// wait_until 0 is a ping without a deadline (the ping of a client whom the StarRocks FE authenticated).
+				if (myds->wait_until && myds->sess->thread->curtime >= myds->wait_until) {
 					NEXT_IMMEDIATE(ASYNC_PING_TIMEOUT);
 				} else {
 					next_event(ASYNC_PING_CONT);

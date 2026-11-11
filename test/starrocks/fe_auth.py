@@ -4,8 +4,7 @@
 ProxySQL holds no passwords in this mode. The FE authenticates every client, and the
 FE connection that took the login belongs to that client until it disconnects.
 The cases create their own FE users through config["backend"] (a user that can run
-CREATE USER) and drop them at the end. ProxySQL must be configured with
-`setup.py --fe-auth`.
+CREATE USER) and drop them at the end. ProxySQL must be configured with `setup.py`.
 
     python3 fe_auth.py CONFIG [--connector-jar mysql-connector-j.jar] [--mysql-cli mysql]
 """
@@ -393,24 +392,27 @@ class Suite:
             connection.close()
             direct.close()
 
+    def fe_idle_seconds(self, identifier):
+        """Seconds since the FE connection started its last command, from the Time column of the FE process list."""
+        with self.oracle.cursor() as cursor:
+            cursor.execute("SHOW PROCESSLIST")
+            columns = [description[0] for description in cursor.description]
+            for row in cursor.fetchall():
+                if int(row[columns.index("Id")]) == identifier:
+                    return int(row[columns.index("Time")])
+        raise AssertionError("the FE connection %d is not in the process list" % identifier)
+
     def ping_reaches_the_fe(self):
-        """COM_PING is answered by the FE, so a ping finds out that the FE connection is gone."""
+        """COM_PING is answered by the FE: the FE starts a command for it, which resets the idle time of the connection."""
         connection = login(self.config, PASSWORD_USER, PASSWORD)
         try:
-            connection.ping(reconnect=False)
             identifier = fe_connection_id(connection)
-            sql(self.oracle, "KILL %d" % identifier)
-            eventually(lambda: identifier not in fe_users(self.oracle), 10)
-            try:
-                connection.ping(reconnect=False)
-            except pymysql.err.Error:
-                return None
-            raise AssertionError("the ping succeeded after the FE connection ended")
+            time.sleep(3)
+            assert self.fe_idle_seconds(identifier) >= 2, "the FE connection was not idle"
+            connection.ping(reconnect=False)
+            assert self.fe_idle_seconds(identifier) < 2, "the ping did not reach the FE"
         finally:
-            try:
-                connection.close()
-            except Exception:
-                pass
+            connection.close()
 
     def field_list_comes_from_the_fe(self):
         """COM_FIELD_LIST lists the columns in the database of the session, as on a direct FE connection."""

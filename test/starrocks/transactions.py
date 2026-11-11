@@ -4,8 +4,7 @@
 StarRocks never sets the autocommit bit in the status flags of its OK packets. A
 ProxySQL that compares that bit with the autocommit of the session sends SET autocommit
 again and again, and the client waits for ever. Each sequence below ran into that
-(a user variable, or SET autocommit=0, before an explicit transaction). It works with
-the sticky setup of setup.py and with --fe-auth.
+(a user variable, or SET autocommit=0, before an explicit transaction).
 """
 import argparse
 import json
