@@ -227,6 +227,9 @@ class MySQL_Connection {
 	 * @param response_len 0 or 20.
 	 */
 	void relay_set_client(const char *user, const char *db, const unsigned char *response, unsigned int response_len);
+	/// Table of the COM_FIELD_LIST that async_list_fields() sends for the client, and the columns that the FE answered.
+	std::string list_fields_table;
+	MYSQL_RES *list_fields_result;
 	void compute_unknown_transaction_status();
 	char gtid_uuid[128];
 
@@ -260,6 +263,8 @@ class MySQL_Connection {
 #endif // PROXYSQL_USE_RESULT
 	void initdb_start();
 	void initdb_cont(short event);
+	void list_fields_start();
+	void list_fields_cont(short event);
 	void set_option_start();
 	void set_option_cont(short event);
 	void set_query(char *stmt, unsigned long length);
@@ -269,6 +274,8 @@ class MySQL_Connection {
 	int async_connect(short event);
 	int async_change_user(short event);
 	int async_select_db(short event);
+	/// Sends COM_FIELD_LIST for list_fields_table. Returns 0 when list_fields_result has the columns, -1 on an error, 1 while it runs.
+	int async_list_fields(short event);
 	int async_set_autocommit(short event, bool);
 	int async_set_names(short event, unsigned int nr);
 	int async_send_simple_command(short event, char *stmt, unsigned long length, bool redact_statement=false); // no result set expected

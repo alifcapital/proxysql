@@ -114,7 +114,13 @@ python test/starrocks/fe_auth.py /tmp/starrocks-test.json --connector-jar /path/
   FE when its client closes the socket. These cases run a query over
   `TABLE(generate_series(1,100000000000))` on the compute nodes and look at the FE process
   list; each case fails if a query from an earlier case still runs. The command line client and Connector/J cases are marked SKIP when the
-  client or the jar is missing; a SKIP is not a pass.
+  client or the jar is missing; a SKIP is not a pass. Other cases compare the answers
+  through ProxySQL with a direct FE connection: `USE` and `COM_INIT_DB` with a catalog and
+  the FE error on `COM_INIT_DB`, a `SET` that the FE refuses, `SET CATALOG` with `USE`,
+  queries such as `SELECT @@version_comment` and `USER()`, `COM_PING`, `COM_FIELD_LIST`,
+  and prepared statements of one text in two databases. The FE itself sometimes misses
+  `KILL QUERY` of a running query, also on a direct connection, so the `KILL QUERY` case
+  can fail without a fault of ProxySQL.
 * `sticky_switch.py` and `upgrade_drain.py` read `fe_auth` from the JSON file. In
   that mode a running query finishes on the drained FE and the client gets the whole
   result, then ProxySQL closes the client connection; an idle client and an open

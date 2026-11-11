@@ -6863,6 +6863,9 @@ bool MySQL_Session::handler_again___multiple_statuses(int *rc) {
 		case CHANGING_SCHEMA:
 			ret = handler_again___status_CHANGING_SCHEMA(rc);
 			break;
+		case STARROCKS_FIELD_LIST:
+			ret = handler_again___status_STARROCKS_FIELD_LIST(rc);
+			break;
 		case SETTING_LDAP_USER_VARIABLE:
 			ret = handler_again___status_SETTING_LDAP_USER_VARIABLE(rc);
 			break;
@@ -7327,6 +7330,19 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 }
 
 void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_FIELD_LIST(PtrSize_t *pkt) {
+	if (session_type == PROXYSQL_SESSION_MYSQL && starrocks_auth_session) {
+		// The FE lists the columns of the table in the catalog and the database of the session, and answers,
+		// see starrocks_auth_session. The packet has the table name, then a wildcard that the FE does not read.
+		const char *table = (const char *)pkt->ptr + sizeof(mysql_hdr) + 1;
+		const size_t table_len = strnlen(table, pkt->size - sizeof(mysql_hdr) - 1);
+		std::string name(table, table_len);
+		l_free(pkt->size,pkt->ptr);
+		client_myds->setDSS_STATE_QUERY_SENT_NET();
+		if (starrocks_forward_to_fe(STARROCKS_FIELD_LIST)) {
+			mybe->server_myds->myconn->list_fields_table = name;
+		}
+		return;
+	}
 	if (session_type == PROXYSQL_SESSION_MYSQL) {
 		/* FIXME: temporary */
 		l_free(pkt->size,pkt->ptr);
@@ -10366,6 +10382,62 @@ int MySQL_Session::handler_again___status_PINGING_SERVER_for_client() {
 	myds->destroy_MySQL_Connection_From_Pool(false);
 	myds->fd = 0;
 	return -1;
+}
+
+bool MySQL_Session::handler_again___status_STARROCKS_FIELD_LIST(int *_rc) {
+	MySQL_Data_Stream *myds = mybe->server_myds;
+	MySQL_Connection *myconn = myds->myconn;
+	myds->DSS = STATE_MARIADB_QUERY;
+	if (myds->mypolls == NULL) {
+		thread->mypolls.add(POLLIN|POLLOUT, myds->fd, myds, thread->curtime);
+	}
+	const int rc = myconn->async_list_fields(myds->revents);
+	if (rc == 1) {
+		return false;
+	}
+	if (rc == 0) {
+		MYSQL_RES *result = myconn->list_fields_result;
+		myconn->list_fields_result = NULL;
+		const unsigned int count = mysql_num_fields(result);
+		MYSQL_FIELD *fields = mysql_fetch_fields(result);
+		// The answer to COM_FIELD_LIST is the column definitions with their default values, without a column count.
+		uint8_t sid = 1;
+		for (unsigned int i = 0; i < count; i++) {
+			MYSQL_FIELD *f = &fields[i];
+			client_myds->myprot.generate_pkt_field(true, NULL, NULL, sid++, f->db, f->table, f->org_table, f->name,
+				f->org_name, f->charsetnr, f->length, f->type, f->flags, f->decimals, true,
+				f->def ? f->def_length : 0, f->def ? f->def : (char *)"");
+		}
+		const uint16_t server_status = myconn->mysql->server_status;
+		if (client_myds->myconn->options.client_flag & CLIENT_DEPRECATE_EOF) {
+			client_myds->myprot.generate_pkt_OK(true, NULL, NULL, sid, 0, 0, server_status, 0, NULL, true);
+		} else {
+			client_myds->myprot.generate_pkt_EOF(true, NULL, NULL, sid, 0, server_status);
+		}
+		mysql_free_result(result);
+		myds->DSS = STATE_MARIADB_GENERIC;
+		client_myds->DSS = STATE_SLEEP;
+		status = WAITING_CLIENT_DATA;
+		return false;
+	}
+	const int myerr = mysql_errno(myconn->mysql);
+	if (myconn->async_state_machine == ASYNC_LIST_FIELDS_FAILED && myerr != 0 && (myerr < 2000 || myerr >= 3000)) {
+		// The FE refused, for example an unknown table. The connection is fine, so the client gets the error of the FE.
+		myconn->async_state_machine = ASYNC_IDLE;
+		myds->DSS = STATE_MARIADB_GENERIC;
+		char sqlstate[10];
+		snprintf(sqlstate, sizeof(sqlstate), "%s", mysql_sqlstate(myconn->mysql));
+		client_myds->myprot.generate_pkt_ERR(true, NULL, NULL, 1, myerr, sqlstate, mysql_error(myconn->mysql));
+		client_myds->DSS = STATE_SLEEP;
+		status = WAITING_CLIENT_DATA;
+		return false;
+	}
+	// The FE connection is broken, and the session cannot get another one, so it ends.
+	detected_broken_connection(__FILE__ , __LINE__ , __func__ , "during COM_FIELD_LIST of a client", myconn, myerr, mysql_error(myconn->mysql), true);
+	myds->destroy_MySQL_Connection_From_Pool(false);
+	myds->fd = 0;
+	*_rc = -1;
+	return false;
 }
 
 void MySQL_Session::starrocks_close_backend_stmt(uint64_t stmt_global_id) {

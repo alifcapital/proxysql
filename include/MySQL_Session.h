@@ -701,6 +701,8 @@ class MySQL_Session: public Base_Session<MySQL_Session, MySQL_Data_Stream, MySQL
 	void starrocks_reply_ok_of_fe(MySQL_Data_Stream *myds);
 	/// The step PINGING_SERVER for a COM_PING of the client. Returns -1 when the session must end.
 	int handler_again___status_PINGING_SERVER_for_client();
+	/// The step STARROCKS_FIELD_LIST: gives the client the columns that the FE listed, or the error of the FE.
+	bool handler_again___status_STARROCKS_FIELD_LIST(int *_rc);
 	/// Counts the prepared statements of the session, to make each of them a statement of its own, see starrocks_auth_session.
 	uint32_t starrocks_prepare_count;
 	/**

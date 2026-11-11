@@ -25,8 +25,21 @@ import traceback
 
 import pymysql
 from pymysql.constants import COMMAND
+from pymysql.protocol import FieldDescriptorPacket
 
 from e2e import connect, eventually, sql
+
+
+def field_list(connection, table):
+    """Sends COM_FIELD_LIST and returns the name, type, length, flags and charset of each column."""
+    connection._execute_command(COMMAND.COM_FIELD_LIST, table + b"\0")
+    columns = []
+    while True:
+        packet = connection._read_packet()
+        if packet.is_eof_packet():
+            return columns
+        field = FieldDescriptorPacket(packet.get_all_data(), connection.encoding)
+        columns.append((field.name, field.type_code, field.length, field.flags, field.charsetnr))
 
 COM_RESET_CONNECTION = 0x1f
 # Runs on the compute nodes until it is stopped.
@@ -398,6 +411,29 @@ class Suite:
                 connection.close()
             except Exception:
                 pass
+
+    def field_list_comes_from_the_fe(self):
+        """COM_FIELD_LIST lists the columns in the database of the session, as on a direct FE connection."""
+        database = "px_fe_auth_fl"
+        sql(self.oracle, "CREATE DATABASE IF NOT EXISTS %s" % database)
+        try:
+            sql(self.oracle, "CREATE TABLE IF NOT EXISTS %s.t (a INT, b VARCHAR(8) DEFAULT 'x') DUPLICATE KEY(a) "
+                "DISTRIBUTED BY HASH(a) PROPERTIES('replication_num'='1')" % database)
+            results = []
+            for connect_to in (login, direct_login):
+                connection = connect_to(self.config, self.config["proxy"]["user"], self.config["proxy"]["password"],
+                                        database=database)
+                try:
+                    columns = field_list(connection, b"t")
+                    error = self.command_error(lambda: field_list(connection, b"px_no_such_table"))
+                    assert sql(connection, "SELECT 1") == ((1,),), "the session goes on after the error"
+                    results.append((columns, error))
+                finally:
+                    connection.close()
+            assert results[0] == results[1], ("COM_FIELD_LIST must answer as the FE", results)
+            assert [column[0] for column in results[0][0]] == ["a", "b"], results
+        finally:
+            sql(self.oracle, "DROP DATABASE IF EXISTS %s FORCE" % database)
 
     def prepared_statements_follow_the_database(self):
         """A statement prepared twice in two databases runs as on a direct FE connection."""
@@ -805,6 +841,7 @@ class Suite:
                 ("SET CATALOG and USE follow the FE", self.set_catalog_then_use),
                 ("queries that ProxySQL could answer get the answer of the FE", self.answers_come_from_the_fe),
                 ("COM_PING is answered by the FE", self.ping_reaches_the_fe),
+                ("COM_FIELD_LIST is answered by the FE", self.field_list_comes_from_the_fe),
                 ("prepared statements in two databases run as on the FE", self.prepared_statements_follow_the_database),
                 ("clients that leave during the login leave no FE connection", self.disconnects_during_login),
                 ("every client holds its own FE connection and nothing is pooled", self.one_fe_connection_per_client),

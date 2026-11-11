@@ -485,6 +485,7 @@ MySQL_Connection::MySQL_Connection() {
 
 	compression_pkt_id=0;
 	mysql_result=NULL;
+	list_fields_result=NULL;
 	query.ptr=NULL;
 	query.length=0;
 	query.stmt=NULL;
@@ -528,6 +529,10 @@ MySQL_Connection::~MySQL_Connection() {
 	}
 	if (local_stmts) {
 		delete local_stmts;
+	}
+	if (list_fields_result) {
+		mysql_free_result(list_fields_result);
+		list_fields_result = NULL;
 	}
 	if (mysql) {
 		// always decrease the counter
@@ -1220,6 +1225,17 @@ void MySQL_Connection::initdb_start() {
 void MySQL_Connection::initdb_cont(short event) {
 	proxy_debug(PROXY_DEBUG_MYSQL_PROTOCOL, 6,"event=%d\n", event);
 	async_exit_status = mysql_select_db_cont(&interr,mysql, mysql_status(event, true));
+}
+
+void MySQL_Connection::list_fields_start() {
+	PROXY_TRACE();
+	list_fields_result = NULL;
+	async_exit_status = mysql_list_fields_start(&list_fields_result, mysql, list_fields_table.c_str(), NULL);
+}
+
+void MySQL_Connection::list_fields_cont(short event) {
+	proxy_debug(PROXY_DEBUG_MYSQL_PROTOCOL, 6,"event=%d\n", event);
+	async_exit_status = mysql_list_fields_cont(&list_fields_result, mysql, mysql_status(event, true));
 }
 
 void MySQL_Connection::set_option_start() {
@@ -2106,6 +2122,33 @@ handler_again:
 			MyHGM->p_update_mysql_error_counter(p_mysql_error_type::mysql, parent->myhgc->hid, parent->address, parent->port, mysql_errno(mysql));
 			//fprintf(stderr,"%s\n",mysql_error(mysql));
 			break;
+		case ASYNC_LIST_FIELDS_START:
+			list_fields_start();
+			if (async_exit_status) {
+				next_event(ASYNC_LIST_FIELDS_CONT);
+			} else {
+				NEXT_IMMEDIATE(ASYNC_LIST_FIELDS_END);
+			}
+			break;
+		case ASYNC_LIST_FIELDS_CONT:
+			list_fields_cont(event);
+			if (async_exit_status) {
+				next_event(ASYNC_LIST_FIELDS_CONT);
+			} else {
+				NEXT_IMMEDIATE(ASYNC_LIST_FIELDS_END);
+			}
+			break;
+		case ASYNC_LIST_FIELDS_END:
+			// mysql_list_fields() returns NULL only on an error; an empty list is a result without fields.
+			if (list_fields_result == NULL) {
+				NEXT_IMMEDIATE(ASYNC_LIST_FIELDS_FAILED);
+			} else {
+				NEXT_IMMEDIATE(ASYNC_LIST_FIELDS_SUCCESSFUL);
+			}
+			break;
+		case ASYNC_LIST_FIELDS_SUCCESSFUL:
+		case ASYNC_LIST_FIELDS_FAILED:
+			break;
 		case ASYNC_SET_OPTION_START:
 			set_option_start();
 			if (async_exit_status) {
@@ -2541,6 +2584,34 @@ int MySQL_Connection::async_change_user(short event) {
 			break;
 	}
 	return 1;
+}
+
+int MySQL_Connection::async_list_fields(short event) {
+	PROXY_TRACE();
+	assert(mysql);
+	assert(ret_mysql);
+	server_status=parent->get_status(); // we copy it here to avoid race condition. The caller will see this
+	switch (async_state_machine) {
+		case ASYNC_LIST_FIELDS_SUCCESSFUL:
+			async_state_machine=ASYNC_IDLE;
+			return 0;
+		case ASYNC_LIST_FIELDS_FAILED:
+			return -1;
+		case ASYNC_IDLE:
+			async_state_machine=ASYNC_LIST_FIELDS_START;
+		default:
+			handler(event);
+			break;
+	}
+	switch (async_state_machine) {
+		case ASYNC_LIST_FIELDS_SUCCESSFUL:
+			async_state_machine=ASYNC_IDLE;
+			return 0;
+		case ASYNC_LIST_FIELDS_FAILED:
+			return -1;
+		default:
+			return 1;
+	}
 }
 
 int MySQL_Connection::async_select_db(short event) {

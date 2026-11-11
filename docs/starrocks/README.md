@@ -152,7 +152,7 @@ What to know when you set it up:
 * The FE keeps the whole session state of the client, and ProxySQL keeps none. ProxySQL
   sends every command of the client to the FE and gives the client the answer of the
   FE: `USE`, `COM_INIT_DB` (an error of the FE leaves the session as it was), `SET` of
-  any variable, `COMMIT`, `ROLLBACK`, `SHOW WARNINGS`, `COM_PING`, `SELECT VERSION()`,
+  any variable, `COMMIT`, `ROLLBACK`, `SHOW WARNINGS`, `COM_PING`, `COM_FIELD_LIST`, `SELECT VERSION()`,
   `LAST_INSERT_ID()` and the other queries that ProxySQL answers itself for its own users.
   It sends nothing of its own before a request, and the query cache is not used. A client
   without a database at login has no database on the FE, as on a direct connection.
@@ -163,8 +163,7 @@ What to know when you set it up:
   greeting carry the connection id of ProxySQL (see `KILL` below), `PROXYSQL INTERNAL`
   commands, `SHOW STATUS LIKE 'Ssl_version'` (about the TLS between the client and
   ProxySQL), the refusal of `LOAD DATA LOCAL INFILE`, and the commands that the FE does
-  not support: `COM_SET_OPTION`, `COM_STATISTICS`, `COM_REFRESH`, `COM_PROCESS_KILL` and
-  `COM_FIELD_LIST`.
+  not support: `COM_SET_OPTION`, `COM_STATISTICS`, `COM_REFRESH` and `COM_PROCESS_KILL`.
 
 Stopping a query works as with a plain MySQL server. A client sends `KILL QUERY id`
 or `KILL id` over a new connection (the `mysql` client does it on Ctrl+C, and
