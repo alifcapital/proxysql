@@ -2861,9 +2861,6 @@ bool MySQL_Connection::IsKnownActiveTransaction() {
 
 bool MySQL_Connection::IsActiveTransaction() {
 	bool ret=false;
-	if (status_flags & STATUS_MYSQL_CONNECTION_STARROCKS_TRANSACTION) {
-		return true;
-	}
 	if (mysql) {
 		ret = (mysql->server_status & SERVER_STATUS_IN_TRANS);
 		if (ret == false && (mysql)->net.last_errno && unknown_transaction_status == true) {

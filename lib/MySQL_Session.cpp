@@ -4,7 +4,6 @@
 #include <cstring>
 #include <string>
 #include <vector>
-#include "StarRocks_Transaction.h"
 #include <mutex>
 #include <unordered_map>
 using json = nlohmann::json;
@@ -4423,11 +4422,6 @@ void MySQL_Session::handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_C
 			}
 		}
 
-		if (starrocks_backend_enabled()) {
-			// We want to follow BEGIN and COMMIT sent as prepared statements, so we keep the text of the statement.
-			CurrentQuery.QueryPointer = (unsigned char*)stmt_info->query;
-			CurrentQuery.QueryLength = stmt_info->query_length;
-		}
 		rc_break=handler___status_WAITING_CLIENT_DATA___STATE_SLEEP___MYSQL_COM_QUERY_qpo(&pkt, &lock_hostgroup, ps_type_execute_stmt);
 		if (rc_break==true) {
 			return;
@@ -6545,17 +6539,6 @@ handler_again:
 							assert(0);
 							break;
 							// LCOV_EXCL_STOP
-					}
-
-					if (myconn->parent->myhgc->attributes.starrocks_backend &&
-						(status == PROCESSING_QUERY || status == PROCESSING_STMT_EXECUTE)) {
-						// The FE does not report an open transaction in the OK packet, so we
-						// flag the connection as in a transaction from BEGIN until COMMIT or ROLLBACK.
-						const int transaction = starrocks_transaction_command(
-							(const char*)CurrentQuery.QueryPointer, CurrentQuery.QueryLength);
-						if (transaction != 0) {
-							myconn->set_status(transaction > 0, STATUS_MYSQL_CONNECTION_STARROCKS_TRANSACTION);
-						}
 					}
 
 					if (mysql_thread___log_mysql_warnings_enabled) {

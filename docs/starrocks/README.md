@@ -88,12 +88,6 @@ A client that reads a buffered response slowly (see the first section) keeps its
 FE connection while it reads, so `ConnUsed` stays above 0. The FE query is
 complete as soon as ProxySQL has fetched the result.
 
-StarRocks does not report an open explicit transaction in its OK packets, so
-ProxySQL follows `BEGIN`, `START TRANSACTION`, `COMMIT` and `ROLLBACK` itself
-and keeps the connection pinned between them. A `COMMIT` or `ROLLBACK` that
-shares a packet with other statements does not release the connection; the next
-single-statement `COMMIT` or `ROLLBACK` does.
-
 ## Let the StarRocks FE authenticate the clients
 
 With the default setup ProxySQL holds the user names and passwords in
